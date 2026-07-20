@@ -24,6 +24,12 @@ import {
 import { PixelEditor } from "./components/PixelEditor";
 import { PixelMark } from "./components/PixelMark";
 import {
+  getImageWorkerClient,
+  isAbortError,
+  resetImageWorkerClient,
+  shouldFallbackFromImageWorker,
+} from "./lib/imageWorkerClient";
+import {
   detectPixelGrid,
   getPixelGridDimensions,
   pixelizeImage,
@@ -34,23 +40,129 @@ import "./App.css";
 
 type SourceImage = {
   file: File;
+  processingFile: File;
   image: HTMLImageElement;
   url: string;
   width: number;
   height: number;
 };
 
+type DetectedGridSetting = {
+  pixelSize: number;
+  offsetX: number;
+  offsetY: number;
+  confidence: number;
+};
+
 const ACCEPTED_IMAGE_TYPES = [
   "image/png",
   "image/jpeg",
   "image/webp",
+  "image/gif",
+  "image/avif",
   "image/bmp",
 ];
+const ACCEPTED_IMAGE_EXTENSIONS = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "webp",
+  "gif",
+  "avif",
+  "bmp",
+]);
 const MAX_SOURCE_PIXELS = 40_000_000;
+const MIN_USABLE_DETECTION_CONFIDENCE = 20;
+const GRID_VALUE_PRECISION = 1000;
+const GRID_VALUE_EPSILON = 1 / GRID_VALUE_PRECISION;
+
+function fileExtension(file: File) {
+  return file.name.split(".").pop()?.toLowerCase() ?? "";
+}
+
+function isAcceptedImageFile(file: File) {
+  if (ACCEPTED_IMAGE_TYPES.includes(file.type)) return true;
+  return (
+    (file.type === "" || file.type === "application/octet-stream") &&
+    ACCEPTED_IMAGE_EXTENSIONS.has(fileExtension(file))
+  );
+}
+
+function isGifFile(file: File) {
+  return file.type === "image/gif" || fileExtension(file) === "gif";
+}
 
 function nextFrame() {
   return new Promise<void>((resolve) => {
     requestAnimationFrame(() => resolve());
+  });
+}
+
+function htmlCanvasToPng(canvas: HTMLCanvasElement) {
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("The GIF frame could not be frozen."));
+    }, "image/png");
+  });
+}
+
+async function freezeGifFrame(
+  file: File,
+  image: HTMLImageElement,
+  isCurrent: () => boolean,
+) {
+  let blob: Blob | null = null;
+
+  if (
+    typeof createImageBitmap === "function" &&
+    typeof OffscreenCanvas !== "undefined" &&
+    typeof OffscreenCanvas.prototype.convertToBlob === "function"
+  ) {
+    let bitmap: ImageBitmap | null = null;
+
+    try {
+      bitmap = await createImageBitmap(file);
+      if (!isCurrent()) {
+        throw new DOMException("GIF import was cancelled.", "AbortError");
+      }
+      if (
+        bitmap.width === image.naturalWidth &&
+        bitmap.height === image.naturalHeight
+      ) {
+        const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+        const context = canvas.getContext("2d");
+        if (context) {
+          context.drawImage(bitmap, 0, 0);
+          blob = await canvas.convertToBlob({ type: "image/png" });
+        }
+      }
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      // Older WebKit builds can decode GIF in <img> but not createImageBitmap.
+      // The canvas fallback below still freezes one deterministic edit frame.
+    } finally {
+      bitmap?.close();
+    }
+  }
+
+  if (!blob) {
+    if (!isCurrent()) {
+      throw new DOMException("GIF import was cancelled.", "AbortError");
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Canvas is not available on this system.");
+    context.drawImage(image, 0, 0);
+    blob = await htmlCanvasToPng(canvas);
+  }
+
+  const frozenName = file.name.replace(/\.gif$/i, "-frame.png");
+  return new File([blob], frozenName, {
+    type: "image/png",
+    lastModified: file.lastModified,
   });
 }
 
@@ -60,10 +172,76 @@ function formatPixelSize(value: number) {
     : value.toFixed(3).replace(/0+$/, "");
 }
 
+function roundGridValue(value: number) {
+  return Math.round(value * GRID_VALUE_PRECISION) / GRID_VALUE_PRECISION;
+}
+
+function maximumPixelSize(width: number, height: number) {
+  return Math.max(1, Math.floor(Math.min(width, height) / 2));
+}
+
+function prepareDetectedGrid(
+  detection: {
+    pixelSize: number;
+    offsetX: number;
+    offsetY: number;
+    confidence: number;
+  },
+  width: number,
+  height: number,
+): {
+  active: Omit<DetectedGridSetting, "confidence"> & {
+    confidence: number | null;
+  };
+  detected: DetectedGridSetting | null;
+} {
+  const valuesAreFinite =
+    Number.isFinite(detection.pixelSize) &&
+    Number.isFinite(detection.offsetX) &&
+    Number.isFinite(detection.offsetY) &&
+    Number.isFinite(detection.confidence);
+
+  if (
+    !valuesAreFinite ||
+    detection.pixelSize < 1 ||
+    detection.confidence < MIN_USABLE_DETECTION_CONFIDENCE
+  ) {
+    return {
+      active: { pixelSize: 1, offsetX: 0, offsetY: 0, confidence: null },
+      detected: null,
+    };
+  }
+
+  const maximum = maximumPixelSize(width, height);
+  const pixelSize = roundGridValue(
+    Math.max(1, Math.min(maximum, detection.pixelSize)),
+  );
+
+  // A clamped pitch no longer describes the phase that the detector scored.
+  // Keep the value inside the UI's safe range, but do not present it as a
+  // restorable detection with potentially invalid offsets.
+  if (Math.abs(pixelSize - detection.pixelSize) > GRID_VALUE_EPSILON) {
+    return {
+      active: { pixelSize, offsetX: 0, offsetY: 0, confidence: null },
+      detected: null,
+    };
+  }
+
+  const detected = {
+    pixelSize,
+    offsetX: roundGridValue(detection.offsetX),
+    offsetY: roundGridValue(detection.offsetY),
+    confidence: Math.round(Math.max(0, Math.min(100, detection.confidence))),
+  };
+
+  return { active: detected, detected };
+}
+
 function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const loadGenerationRef = useRef(0);
   const conversionGenerationRef = useRef(0);
+  const workerFallbackFileRef = useRef<File | null>(null);
   const sourceRef = useRef<SourceImage | null>(null);
   const resultRef = useRef<PixelizeResult | null>(null);
   const [source, setSource] = useState<SourceImage | null>(null);
@@ -71,12 +249,26 @@ function App() {
   const [pixelSize, setPixelSize] = useState(8);
   const [gridOffset, setGridOffset] = useState({ x: 0, y: 0 });
   const [confidence, setConfidence] = useState<number | null>(null);
+  const [detectedGrid, setDetectedGrid] =
+    useState<DetectedGridSetting | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [sourcePalette, setSourcePalette] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const shortcutHandlerRef = useRef<(event: globalThis.KeyboardEvent) => void>(
+    () => undefined,
+  );
+
+  shortcutHandlerRef.current = (event) => {
+    if (isEditorOpen) return;
+
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault();
+      void handlePixelize();
+    }
+  };
 
   const outputSize = useMemo(() => {
     if (!source) return null;
@@ -112,33 +304,48 @@ function App() {
     return () => {
       loadGenerationRef.current += 1;
       conversionGenerationRef.current += 1;
+      resetImageWorkerClient("Pixelloid was closed.");
       if (sourceRef.current) URL.revokeObjectURL(sourceRef.current.url);
       if (resultRef.current) URL.revokeObjectURL(resultRef.current.url);
     };
   }, []);
 
   useEffect(() => {
-    function handleShortcut(event: globalThis.KeyboardEvent) {
-      if (isEditorOpen) return;
+    function preventWindowFileDrop(event: globalThis.DragEvent) {
+      if (!event.dataTransfer?.types.includes("Files")) return;
 
-      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-        event.preventDefault();
-        void handlePixelize();
-      }
+      event.preventDefault();
+      if (event.type === "drop") setIsDragging(false);
+    }
+
+    window.addEventListener("dragover", preventWindowFileDrop);
+    window.addEventListener("drop", preventWindowFileDrop);
+
+    return () => {
+      window.removeEventListener("dragover", preventWindowFileDrop);
+      window.removeEventListener("drop", preventWindowFileDrop);
+    };
+  }, []);
+
+  useEffect(() => {
+    function handleShortcut(event: globalThis.KeyboardEvent) {
+      shortcutHandlerRef.current(event);
     }
 
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  });
+  }, []);
 
   async function loadFile(file: File) {
-    if (!ACCEPTED_IMAGE_TYPES.includes(file.type)) {
-      setError("Choose a PNG, JPG, WebP, or BMP image.");
+    if (!isAcceptedImageFile(file)) {
+      setError("Choose a PNG, JPG, WebP, GIF, AVIF, or BMP image.");
       return;
     }
 
     const generation = ++loadGenerationRef.current;
     conversionGenerationRef.current += 1;
+    resetImageWorkerClient("A newer image was selected.");
+    workerFallbackFileRef.current = null;
     setError(null);
     setIsAnalyzing(true);
     setIsProcessing(false);
@@ -147,16 +354,25 @@ function App() {
     replaceResult(null);
     await nextFrame();
 
-    const url = URL.createObjectURL(file);
-    const image = new Image();
+    if (generation !== loadGenerationRef.current) return;
+
+    const originalUrl = URL.createObjectURL(file);
+    let activeUrl = originalUrl;
+    let processingFile = file;
+    let image = new Image();
     image.decoding = "async";
-    image.src = url;
+    image.src = originalUrl;
+
+    function revokePendingSourceUrls() {
+      URL.revokeObjectURL(activeUrl);
+      if (activeUrl !== originalUrl) URL.revokeObjectURL(originalUrl);
+    }
 
     try {
       await image.decode();
 
       if (generation !== loadGenerationRef.current) {
-        URL.revokeObjectURL(url);
+        revokePendingSourceUrls();
         return;
       }
 
@@ -164,30 +380,98 @@ function App() {
         throw new Error("image-too-large");
       }
 
+      if (isGifFile(file)) {
+        processingFile = await freezeGifFrame(
+          file,
+          image,
+          () => generation === loadGenerationRef.current,
+        );
+
+        if (generation !== loadGenerationRef.current) {
+          revokePendingSourceUrls();
+          return;
+        }
+
+        const frozenUrl = URL.createObjectURL(processingFile);
+        activeUrl = frozenUrl;
+        const frozenImage = new Image();
+        frozenImage.decoding = "async";
+        frozenImage.src = frozenUrl;
+        await frozenImage.decode();
+
+        if (generation !== loadGenerationRef.current) {
+          revokePendingSourceUrls();
+          return;
+        }
+
+        URL.revokeObjectURL(originalUrl);
+        image = frozenImage;
+      }
+
       const loaded: SourceImage = {
         file,
+        processingFile,
         image,
-        url,
+        url: activeUrl,
         width: image.naturalWidth,
         height: image.naturalHeight,
       };
-      const detection = detectPixelGrid(image);
-      const palette = extractImagePalette(image);
+      let detection;
+      let palette;
+      const worker = getImageWorkerClient();
+
+      if (worker) {
+        try {
+          const analysis = await worker.analyze(processingFile, {
+            expectedWidth: loaded.width,
+            expectedHeight: loaded.height,
+            maximumColors: 24,
+          });
+          detection = analysis.detection;
+          palette = analysis.palette;
+        } catch (workerError) {
+          if (
+            isAbortError(workerError) ||
+            !shouldFallbackFromImageWorker(workerError)
+          ) {
+            throw workerError;
+          }
+
+          workerFallbackFileRef.current = processingFile;
+          detection = detectPixelGrid(image);
+          palette = extractImagePalette(image);
+        }
+      } else {
+        detection = detectPixelGrid(image);
+        palette = extractImagePalette(image);
+      }
+      const preparedGrid = prepareDetectedGrid(
+        detection,
+        loaded.width,
+        loaded.height,
+      );
 
       if (generation !== loadGenerationRef.current) {
-        URL.revokeObjectURL(url);
+        revokePendingSourceUrls();
         return;
       }
 
       replaceSource(loaded);
-      setPixelSize(detection.pixelSize);
-      setGridOffset({ x: detection.offsetX, y: detection.offsetY });
-      setConfidence(detection.confidence);
+      setPixelSize(preparedGrid.active.pixelSize);
+      setGridOffset({
+        x: preparedGrid.active.offsetX,
+        y: preparedGrid.active.offsetY,
+      });
+      setConfidence(preparedGrid.active.confidence);
+      setDetectedGrid(preparedGrid.detected);
       setSourcePalette(palette);
     } catch (caughtError) {
-      URL.revokeObjectURL(url);
+      revokePendingSourceUrls();
 
-      if (generation === loadGenerationRef.current) {
+      if (
+        generation === loadGenerationRef.current &&
+        !isAbortError(caughtError)
+      ) {
         setError(
           caughtError instanceof Error &&
             caughtError.message === "image-too-large"
@@ -228,30 +512,59 @@ function App() {
 
   function updatePixelSize(nextSize: number) {
     if (!source) return;
-    const maximum = Math.max(
-      1,
-      Math.floor(Math.min(source.width, source.height) / 2),
+    const maximum = maximumPixelSize(source.width, source.height);
+    const clampedSize = roundGridValue(
+      Math.max(1, Math.min(maximum, nextSize)),
     );
-    const clampedSize =
-      Math.round(
-        Math.max(1, Math.min(maximum, nextSize)) * 1000,
-      ) / 1000;
+    const restoresDetection =
+      detectedGrid !== null &&
+      Math.abs(clampedSize - detectedGrid.pixelSize) < GRID_VALUE_EPSILON;
+    const nextOffset = restoresDetection
+      ? { x: detectedGrid.offsetX, y: detectedGrid.offsetY }
+      : { x: 0, y: 0 };
+    const nextConfidence = restoresDetection
+      ? detectedGrid.confidence
+      : null;
 
     if (
       clampedSize === pixelSize &&
-      gridOffset.x === 0 &&
-      gridOffset.y === 0
+      gridOffset.x === nextOffset.x &&
+      gridOffset.y === nextOffset.y &&
+      confidence === nextConfidence
     ) {
       return;
     }
 
     conversionGenerationRef.current += 1;
+    resetImageWorkerClient("Pixel-grid settings changed.");
     setIsProcessing(false);
     setPixelSize(clampedSize);
-    setGridOffset({ x: 0, y: 0 });
-    setConfidence(null);
+    setGridOffset(nextOffset);
+    setConfidence(nextConfidence);
     setIsEditorOpen(false);
     replaceResult(null);
+  }
+
+  function stepPixelSize(direction: -1 | 1) {
+    const integerTarget =
+      direction === -1
+        ? Math.max(1, Math.ceil(pixelSize) - 1)
+        : Math.floor(pixelSize) + 1;
+    let target = integerTarget;
+
+    if (detectedGrid) {
+      const detectedSize = detectedGrid.pixelSize;
+      const crossesDetection =
+        direction === -1
+          ? pixelSize > detectedSize + GRID_VALUE_EPSILON &&
+            integerTarget <= detectedSize + GRID_VALUE_EPSILON
+          : pixelSize < detectedSize - GRID_VALUE_EPSILON &&
+            integerTarget >= detectedSize - GRID_VALUE_EPSILON;
+
+      if (crossesDetection) target = detectedSize;
+    }
+
+    updatePixelSize(target);
   }
 
   async function handlePixelize() {
@@ -268,8 +581,64 @@ function App() {
     setIsProcessing(true);
     await nextFrame();
 
+    if (
+      generation !== conversionGenerationRef.current ||
+      sourceRef.current !== sourceAtStart
+    ) {
+      return;
+    }
+
     try {
-      const nextResult = await pixelizeImage(source.image, settings);
+      let nextResult: PixelizeResult;
+      const worker =
+        workerFallbackFileRef.current === source.processingFile
+          ? null
+          : getImageWorkerClient();
+
+      if (worker) {
+        try {
+          const generated = await worker.pixelize(
+            source.processingFile,
+            settings,
+            {
+              expectedWidth: source.width,
+              expectedHeight: source.height,
+            },
+          );
+
+          // Worker blobs do not own a URL yet. Check staleness first so an
+          // obsolete conversion can be garbage-collected without cleanup.
+          if (
+            generation !== conversionGenerationRef.current ||
+            sourceRef.current !== sourceAtStart
+          ) {
+            return;
+          }
+
+          nextResult = {
+            blob: generated.blob,
+            url: URL.createObjectURL(generated.blob),
+            width: generated.width,
+            height: generated.height,
+            sourceGrid: {
+              xRanges: generated.xRanges,
+              yRanges: generated.yRanges,
+            },
+          };
+        } catch (workerError) {
+          if (
+            isAbortError(workerError) ||
+            !shouldFallbackFromImageWorker(workerError)
+          ) {
+            throw workerError;
+          }
+
+          workerFallbackFileRef.current = source.processingFile;
+          nextResult = await pixelizeImage(source.image, settings);
+        }
+      } else {
+        nextResult = await pixelizeImage(source.image, settings);
+      }
 
       if (
         generation !== conversionGenerationRef.current ||
@@ -281,8 +650,11 @@ function App() {
 
       replaceResult(nextResult);
       setIsEditorOpen(false);
-    } catch {
-      if (generation === conversionGenerationRef.current) {
+    } catch (caughtError) {
+      if (
+        generation === conversionGenerationRef.current &&
+        !isAbortError(caughtError)
+      ) {
         setError(
           "The image could not be pixelized. Try a smaller source image.",
         );
@@ -297,11 +669,14 @@ function App() {
   function reset() {
     loadGenerationRef.current += 1;
     conversionGenerationRef.current += 1;
+    resetImageWorkerClient("The workspace was reset.");
+    workerFallbackFileRef.current = null;
     replaceSource(null);
     replaceResult(null);
     setPixelSize(8);
     setGridOffset({ x: 0, y: 0 });
     setConfidence(null);
+    setDetectedGrid(null);
     setIsAnalyzing(false);
     setIsProcessing(false);
     setIsDragging(false);
@@ -313,6 +688,11 @@ function App() {
   const downloadName = source
     ? `${source.file.name.replace(/\.[^.]+$/, "")}-pixel-perfect.png`
     : "pixel-perfect.png";
+  const isUsingDetectedGrid =
+    detectedGrid !== null &&
+    Math.abs(pixelSize - detectedGrid.pixelSize) < GRID_VALUE_EPSILON &&
+    Math.abs(gridOffset.x - detectedGrid.offsetX) < GRID_VALUE_EPSILON &&
+    Math.abs(gridOffset.y - detectedGrid.offsetY) < GRID_VALUE_EPSILON;
 
   return (
     <div className="app-shell">
@@ -420,7 +800,10 @@ function App() {
                   </div>
                   <h2>{isAnalyzing ? "READING PIXELS…" : "IMPORT IMAGE"}</h2>
                   <p>Drop your pseudo-pixel art here</p>
-                  <span className="file-hint">PNG · JPG · WEBP · BMP</span>
+                  <span className="file-hint">
+                    PNG · JPG · WEBP · GIF · AVIF · BMP
+                  </span>
+                  <span className="frame-hint">GIF IMPORTS ONE FRAME</span>
                   <span
                     aria-hidden="true"
                     className={`secondary-button ${
@@ -493,9 +876,9 @@ function App() {
             </div>
 
             <div className={`image-stage result-stage ${result ? "has-image" : ""}`}>
-              <div className="result-grid" />
               {result ? (
                 <>
+                  <div className="checkerboard" aria-hidden="true" />
                   <img
                     alt="Pixel-perfect result"
                     className="preview-image result-image"
@@ -512,18 +895,21 @@ function App() {
                   </button>
                 </>
               ) : (
-                <div className="empty-state result-empty">
-                  <div className="result-glyph">
-                    <PixelMark size={42} />
-                    <Sparkles
-                      className="result-sparkle"
-                      size={17}
-                      strokeWidth={1.8}
-                    />
+                <>
+                  <div className="result-grid" aria-hidden="true" />
+                  <div className="empty-state result-empty">
+                    <div className="result-glyph">
+                      <PixelMark size={42} />
+                      <Sparkles
+                        className="result-sparkle"
+                        size={17}
+                        strokeWidth={1.8}
+                      />
+                    </div>
+                    <h2>TRUE PIXELS LAND HERE</h2>
+                    <p>Import an image, then hit pixellize.</p>
                   </div>
-                  <h2>TRUE PIXELS LAND HERE</h2>
-                  <p>Import an image, then hit pixellize.</p>
-                </div>
+                </>
               )}
             </div>
 
@@ -566,6 +952,18 @@ function App() {
                     : `${confidence}% CONFIDENCE`}
                 </strong>
               </div>
+              {detectedGrid && !isUsingDetectedGrid && (
+                <button
+                  aria-label="Restore detected grid settings"
+                  className="restore-detection-button"
+                  disabled={isAnalyzing || isProcessing}
+                  title={`Restore ${formatPixelSize(detectedGrid.pixelSize)} px and detected offsets`}
+                  type="button"
+                  onClick={() => updatePixelSize(detectedGrid.pixelSize)}
+                >
+                  <RotateCcw size={12} strokeWidth={2.2} />
+                </button>
+              )}
             </div>
 
             <div className="metric">
@@ -584,9 +982,7 @@ function App() {
                   aria-label="Decrease source pixel size"
                   disabled={isAnalyzing || isProcessing}
                   type="button"
-                  onClick={() =>
-                    updatePixelSize(Math.max(1, Math.ceil(pixelSize) - 1))
-                  }
+                  onClick={() => stepPixelSize(-1)}
                 >
                   <Minus size={13} />
                 </button>
@@ -595,7 +991,7 @@ function App() {
                   aria-label="Increase source pixel size"
                   disabled={isAnalyzing || isProcessing}
                   type="button"
-                  onClick={() => updatePixelSize(Math.floor(pixelSize) + 1)}
+                  onClick={() => stepPixelSize(1)}
                 >
                   <Plus size={13} />
                 </button>

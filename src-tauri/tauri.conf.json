@@ -12,12 +12,15 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Pixelloid",
         "width": 1280,
         "height": 820,
         "minWidth": 860,
         "minHeight": 650,
-        "center": true
+        "center": true,
+        "create": false,
+        "dragDropEnabled": false
       }
     ],
     "security": {

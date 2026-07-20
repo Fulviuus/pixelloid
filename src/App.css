@@ -345,14 +345,14 @@ button:disabled {
 
 .checkerboard {
   position: absolute;
+  z-index: 1;
   inset: 0;
-  opacity: 0.32;
-  background-color: #12151c;
+  background-color: #dfe2dc;
   background-image:
-    linear-gradient(45deg, #181b23 25%, transparent 25%),
-    linear-gradient(-45deg, #181b23 25%, transparent 25%),
-    linear-gradient(45deg, transparent 75%, #181b23 75%),
-    linear-gradient(-45deg, transparent 75%, #181b23 75%);
+    linear-gradient(45deg, #bfc4bc 25%, transparent 25%),
+    linear-gradient(-45deg, #bfc4bc 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #bfc4bc 75%),
+    linear-gradient(-45deg, transparent 75%, #bfc4bc 75%);
   background-position:
     0 0,
     0 8px,
@@ -516,6 +516,15 @@ button:disabled {
   letter-spacing: 0.1em;
 }
 
+.frame-hint {
+  margin-top: 4px;
+  color: #5a5f6b;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+}
+
 .secondary-button {
   display: inline-flex;
   align-items: center;
@@ -560,10 +569,6 @@ button:disabled {
   background-position: center;
   background-size: 20px 20px;
   mask-image: radial-gradient(circle, #000 0%, transparent 70%);
-}
-
-.result-panel.done .result-grid {
-  opacity: 0.17;
 }
 
 .result-glyph {
@@ -791,8 +796,33 @@ button:disabled {
 
 .detection-heading {
   display: flex;
+  min-width: 0;
   align-items: center;
   gap: 11px;
+}
+
+.restore-detection-button {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  place-items: center;
+  margin-left: auto;
+  border: 1px solid #42483d;
+  border-radius: 0;
+  padding: 0;
+  color: #9cab67;
+  background: #1a1f18;
+  cursor: pointer;
+}
+
+.restore-detection-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.restore-detection-button:disabled {
+  opacity: 0.42;
 }
 
 .scan-icon {
@@ -1201,6 +1231,9 @@ button:disabled {
 .pixel-editor-original-overlay {
   position: absolute;
   z-index: 2;
+  inset: 0;
+  width: 100%;
+  height: 100%;
   visibility: hidden;
   opacity: 0;
   object-fit: fill;

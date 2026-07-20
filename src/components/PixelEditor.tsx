@@ -7,7 +7,6 @@ import {
   useMemo,
   useRef,
   useState,
-  WheelEvent as ReactWheelEvent,
 } from "react";
 import {
   Check,
@@ -43,6 +42,7 @@ type CanvasSize = {
 };
 
 type ResultCrop = NonNullable<PixelizeResult["crop"]>;
+type SourceGridMapping = NonNullable<PixelizeResult["sourceGrid"]>;
 
 type CanvasSnapshot = {
   image: ImageData;
@@ -63,6 +63,16 @@ export type PixelEditorProps = {
 const ZOOM_LEVELS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32] as const;
 const WHEEL_ZOOM_THRESHOLD = 40;
 const MAX_BULK_EDIT_PIXELS = 4_000_000;
+const MAX_ORIGINAL_OVERLAY_PIXELS = 4_000_000;
+const MAX_ORIGINAL_OVERLAY_DIMENSION = 16_384;
+
+type ActivePointerInteraction =
+  | { kind: "crop" }
+  | {
+      kind: "draw";
+      tool: "pencil" | "eraser";
+      color: string;
+    };
 
 type ZoomAnchor = {
   frameX: number;
@@ -339,6 +349,17 @@ function removeEdgeConnectedBackground(
   const image = context.getImageData(0, 0, width, height);
   const pixels = image.data;
   const borderPixels: number[] = [];
+  let visiblePixels = 0;
+
+  for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
+    if (pixels[pixelIndex * 4 + 3] >= 16) {
+      visiblePixels += 1;
+    }
+  }
+
+  if (visiblePixels === 0) {
+    return { detected: true, removedPixels: 0, noOpaquePixels: true };
+  }
 
   for (let x = 0; x < width; x += 1) {
     borderPixels.push(x, (height - 1) * width + x);
@@ -346,21 +367,98 @@ function removeEdgeConnectedBackground(
   for (let y = 1; y < height - 1; y += 1) {
     borderPixels.push(y * width, y * width + width - 1);
   }
+  const hasVisibleBorder = borderPixels.some(
+    (pixelIndex) => pixels[pixelIndex * 4 + 3] >= 16,
+  );
 
-  const samples = borderPixels.flatMap((pixelIndex): RgbColor[] => {
+  // Walk through transparent padding and model the first visible frontier.
+  // This handles an inset opaque backdrop without mistaking the empty outer
+  // ring for proof that no background remains.
+  const transparentVisited = new Uint8Array(width * height);
+  const frontierSeen = new Uint8Array(width * height);
+  const transparentQueue = new Uint32Array(width * height);
+  const frontierPixels: number[] = [];
+  const samples: RgbColor[] = [];
+  let transparentHead = 0;
+  let transparentTail = 0;
+
+  function visitExterior(pixelIndex: number) {
     const offset = pixelIndex * 4;
-    if (pixels[offset + 3] < 128) return [];
-    return [
-      {
-        red: pixels[offset],
-        green: pixels[offset + 1],
-        blue: pixels[offset + 2],
-      },
-    ];
-  });
+
+    if (pixels[offset + 3] < 16) {
+      if (transparentVisited[pixelIndex]) return;
+      transparentVisited[pixelIndex] = 1;
+      transparentQueue[transparentTail] = pixelIndex;
+      transparentTail += 1;
+      return;
+    }
+
+    if (frontierSeen[pixelIndex]) return;
+    frontierSeen[pixelIndex] = 1;
+    frontierPixels.push(pixelIndex);
+    samples.push({
+      red: pixels[offset],
+      green: pixels[offset + 1],
+      blue: pixels[offset + 2],
+    });
+  }
+
+  for (const pixelIndex of borderPixels) visitExterior(pixelIndex);
+
+  while (transparentHead < transparentTail) {
+    const pixelIndex = transparentQueue[transparentHead];
+    transparentHead += 1;
+    const x = pixelIndex % width;
+    const y = Math.floor(pixelIndex / width);
+
+    if (x > 0) visitExterior(pixelIndex - 1);
+    if (x + 1 < width) visitExterior(pixelIndex + 1);
+    if (y > 0) visitExterior(pixelIndex - width);
+    if (y + 1 < height) visitExterior(pixelIndex + width);
+  }
 
   if (samples.length === 0) {
-    return { detected: true, removedPixels: 0 };
+    return { detected: false, removedPixels: 0, noOpaquePixels: false };
+  }
+
+  if (!hasVisibleBorder) {
+    let left = width;
+    let right = -1;
+    let top = height;
+    let bottom = -1;
+
+    for (const pixelIndex of frontierPixels) {
+      const x = pixelIndex % width;
+      const y = Math.floor(pixelIndex / width);
+      left = Math.min(left, x);
+      right = Math.max(right, x);
+      top = Math.min(top, y);
+      bottom = Math.max(bottom, y);
+    }
+
+    const spanX = Math.max(1, right - left + 1);
+    const spanY = Math.max(1, bottom - top + 1);
+    let horizontalEdges = 0;
+    let verticalEdges = 0;
+
+    for (const pixelIndex of frontierPixels) {
+      const x = pixelIndex % width;
+      const y = Math.floor(pixelIndex / width);
+      if (y === top || y === bottom) horizontalEdges += 1;
+      if (x === left || x === right) verticalEdges += 1;
+    }
+
+    // A transparent canvas around a sprite is already background-free. Only
+    // learn an inset background when the opaque frontier resembles a frame;
+    // otherwise a uniform sprite outline could be erased by mistake.
+    const frameCoverage = Math.min(
+      horizontalEdges / (spanX * 2),
+      verticalEdges / (spanY * 2),
+    );
+    const interiorCoverage = visiblePixels / (spanX * spanY);
+    if (frameCoverage < 0.45 || interiorCoverage < 0.65) {
+      return { detected: false, removedPixels: 0, noOpaquePixels: false };
+    }
   }
 
   let model: ReturnType<typeof fitBorderModel> = null;
@@ -378,7 +476,9 @@ function removeEdgeConnectedBackground(
     }
   }
 
-  if (!model) return { detected: false, removedPixels: 0 };
+  if (!model) {
+    return { detected: false, removedPixels: 0, noOpaquePixels: false };
+  }
 
   const tolerance = Math.max(10, Math.min(24, model.p95 + 6));
   const visited = new Uint8Array(width * height);
@@ -434,7 +534,7 @@ function removeEdgeConnectedBackground(
   }
 
   if (removedPixels > 0) context.putImageData(image, 0, 0);
-  return { detected: true, removedPixels };
+  return { detected: true, removedPixels, noOpaquePixels: false };
 }
 
 function initialZoom(width: number, height: number) {
@@ -447,6 +547,171 @@ function initialZoom(width: number, height: number) {
   }
 
   return selected;
+}
+
+function evenlyDividedRanges(length: number, count: number) {
+  return Array.from({ length: count }, (_, index): [number, number] => [
+    (index * length) / count,
+    ((index + 1) * length) / count,
+  ]);
+}
+
+function currentSourceRanges(
+  mapping: SourceGridMapping | undefined,
+  crop: ResultCrop,
+  size: CanvasSize,
+  sourceWidth: number,
+  sourceHeight: number,
+) {
+  const fallbackX = evenlyDividedRanges(sourceWidth, crop.baseWidth);
+  const fallbackY = evenlyDividedRanges(sourceHeight, crop.baseHeight);
+  const fullX =
+    mapping && mapping.xRanges.length >= crop.baseWidth
+      ? mapping.xRanges
+      : fallbackX;
+  const fullY =
+    mapping && mapping.yRanges.length >= crop.baseHeight
+      ? mapping.yRanges
+      : fallbackY;
+
+  return {
+    x: fullX.slice(crop.x, crop.x + size.width),
+    y: fullY.slice(crop.y, crop.y + size.height),
+  };
+}
+
+function renderOriginalOverlay(
+  canvas: HTMLCanvasElement,
+  image: HTMLImageElement,
+  xRanges: Array<[number, number]>,
+  yRanges: Array<[number, number]>,
+  zoom: number,
+) {
+  if (xRanges.length === 0 || yRanges.length === 0) return;
+
+  const renderScale = Math.max(
+    Number.EPSILON,
+    Math.min(
+      zoom,
+      Math.sqrt(
+        MAX_ORIGINAL_OVERLAY_PIXELS /
+          Math.max(1, xRanges.length * yRanges.length),
+      ),
+      MAX_ORIGINAL_OVERLAY_DIMENSION / xRanges.length,
+      MAX_ORIGINAL_OVERLAY_DIMENSION / yRanges.length,
+    ),
+  );
+  const targetWidth = Math.max(1, Math.floor(xRanges.length * renderScale));
+  const targetHeight = Math.max(1, Math.floor(yRanges.length * renderScale));
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  context.clearRect(0, 0, targetWidth, targetHeight);
+  context.imageSmoothingEnabled = false;
+
+  const sourceLeft = xRanges[0][0];
+  const sourceRight = xRanges[xRanges.length - 1][1];
+  const sourceTop = yRanges[0][0];
+  const sourceBottom = yRanges[yRanges.length - 1][1];
+  const sourceSpanX = Math.max(1, sourceRight - sourceLeft);
+  const sourceSpanY = Math.max(1, sourceBottom - sourceTop);
+  const horizontalFirstPixels = targetWidth * sourceSpanY;
+  const verticalFirstPixels = sourceSpanX * targetHeight;
+
+  if (horizontalFirstPixels <= verticalFirstPixels) {
+    const intermediate = document.createElement("canvas");
+    intermediate.width = targetWidth;
+    intermediate.height = Math.ceil(sourceSpanY);
+    const intermediateContext = intermediate.getContext("2d");
+    if (!intermediateContext) return;
+    intermediateContext.imageSmoothingEnabled = false;
+
+    for (let x = 0; x < xRanges.length; x += 1) {
+      const [left, right] = xRanges[x];
+      const destinationLeft = (x * targetWidth) / xRanges.length;
+      const destinationRight = ((x + 1) * targetWidth) / xRanges.length;
+      intermediateContext.drawImage(
+        image,
+        left,
+        sourceTop,
+        Math.max(1, right - left),
+        sourceSpanY,
+        destinationLeft,
+        0,
+        destinationRight - destinationLeft,
+        intermediate.height,
+      );
+    }
+
+    for (let y = 0; y < yRanges.length; y += 1) {
+      const [top, bottom] = yRanges[y];
+      const destinationTop = (y * targetHeight) / yRanges.length;
+      const destinationBottom = ((y + 1) * targetHeight) / yRanges.length;
+      const mappedTop =
+        ((top - sourceTop) / sourceSpanY) * intermediate.height;
+      const mappedHeight =
+        ((bottom - top) / sourceSpanY) * intermediate.height;
+      context.drawImage(
+        intermediate,
+        0,
+        mappedTop,
+        targetWidth,
+        Math.max(1, mappedHeight),
+        0,
+        destinationTop,
+        targetWidth,
+        destinationBottom - destinationTop,
+      );
+    }
+    return;
+  }
+
+  const intermediate = document.createElement("canvas");
+  intermediate.width = Math.ceil(sourceSpanX);
+  intermediate.height = targetHeight;
+  const intermediateContext = intermediate.getContext("2d");
+  if (!intermediateContext) return;
+  intermediateContext.imageSmoothingEnabled = false;
+
+  for (let y = 0; y < yRanges.length; y += 1) {
+    const [top, bottom] = yRanges[y];
+    const destinationTop = (y * targetHeight) / yRanges.length;
+    const destinationBottom = ((y + 1) * targetHeight) / yRanges.length;
+    intermediateContext.drawImage(
+      image,
+      sourceLeft,
+      top,
+      sourceSpanX,
+      Math.max(1, bottom - top),
+      0,
+      destinationTop,
+      intermediate.width,
+      destinationBottom - destinationTop,
+    );
+  }
+
+  for (let x = 0; x < xRanges.length; x += 1) {
+    const [left, right] = xRanges[x];
+    const destinationLeft = (x * targetWidth) / xRanges.length;
+    const destinationRight = ((x + 1) * targetWidth) / xRanges.length;
+    const mappedLeft =
+      ((left - sourceLeft) / sourceSpanX) * intermediate.width;
+    const mappedWidth =
+      ((right - left) / sourceSpanX) * intermediate.width;
+    context.drawImage(
+      intermediate,
+      mappedLeft,
+      0,
+      Math.max(1, mappedWidth),
+      targetHeight,
+      destinationLeft,
+      0,
+      destinationRight - destinationLeft,
+      targetHeight,
+    );
+  }
 }
 
 function canvasToPng(canvas: HTMLCanvasElement) {
@@ -473,8 +738,11 @@ export function PixelEditor({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const canvasFrameRef = useRef<HTMLDivElement>(null);
   const canvasScrollRef = useRef<HTMLDivElement>(null);
+  const originalOverlayRef = useRef<HTMLCanvasElement>(null);
+  const originalImageRef = useRef<HTMLImageElement | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const activePointerRef = useRef<number | null>(null);
+  const activeInteractionRef = useRef<ActivePointerInteraction | null>(null);
   const lastPointRef = useRef<PixelPoint | null>(null);
   const cropStartRef = useRef<PixelPoint | null>(null);
   const pendingCanvasImageRef = useRef<ImageData | null>(null);
@@ -520,6 +788,7 @@ export function PixelEditor({
   const [isReady, setIsReady] = useState(false);
   const [isApplying, setIsApplying] = useState(false);
   const [showOriginal, setShowOriginal] = useState(false);
+  const [originalImageRevision, setOriginalImageRevision] = useState(0);
   const [canUndoBulkEdit, setCanUndoBulkEdit] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -540,12 +809,6 @@ export function PixelEditor({
     "--pixel-editor-grid-size-y": `${zoom}px`,
     "--pixel-editor-grid-opacity":
       !showOriginal && zoom >= 4 ? "0.55" : "0",
-  } as CSSProperties;
-  const originalOverlayStyle = {
-    left: `${-resultCrop.x * zoom}px`,
-    top: `${-resultCrop.y * zoom}px`,
-    width: `${resultCrop.baseWidth * zoom}px`,
-    height: `${resultCrop.baseHeight * zoom}px`,
   } as CSSProperties;
   const cropSelectionStyle = cropSelection
     ? ({
@@ -570,6 +833,27 @@ export function PixelEditor({
       previousFocus?.focus();
     };
   }, []);
+
+  useEffect(() => {
+    let isCurrent = true;
+    const image = new Image();
+    originalImageRef.current = null;
+
+    image.onload = () => {
+      if (!isCurrent) return;
+      originalImageRef.current = image;
+      setOriginalImageRevision((revision) => revision + 1);
+    };
+    image.src = sourceUrl;
+
+    return () => {
+      isCurrent = false;
+      image.onload = null;
+      if (originalImageRef.current === image) {
+        originalImageRef.current = null;
+      }
+    };
+  }, [sourceUrl]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -652,6 +936,39 @@ export function PixelEditor({
     pendingZoomAnchorRef.current = null;
   }, [canvasDisplayHeight, canvasDisplayWidth]);
 
+  useLayoutEffect(() => {
+    const overlay = originalOverlayRef.current;
+    const original = originalImageRef.current;
+    if (!showOriginal || !overlay || !original) return;
+
+    const ranges = currentSourceRanges(
+      result.sourceGrid,
+      resultCrop,
+      canvasSize,
+      sourceWidth,
+      sourceHeight,
+    );
+    renderOriginalOverlay(overlay, original, ranges.x, ranges.y, zoom);
+  }, [
+    canvasSize,
+    originalImageRevision,
+    result.sourceGrid,
+    resultCrop,
+    showOriginal,
+    sourceHeight,
+    sourceWidth,
+    zoom,
+  ]);
+
+  useEffect(() => {
+    const scroller = canvasScrollRef.current;
+    if (!scroller) return;
+
+    const onWheel = (event: WheelEvent) => handleCanvasWheel(event);
+    scroller.addEventListener("wheel", onWheel, { passive: false });
+    return () => scroller.removeEventListener("wheel", onWheel);
+  }, [isApplying, isReady, zoom]);
+
   function getCanvasPoint(event: ReactPointerEvent<HTMLCanvasElement>) {
     const canvas = canvasRef.current;
     if (!canvas) return null;
@@ -679,21 +996,30 @@ export function PixelEditor({
     };
   }
 
-  function drawPixel(point: PixelPoint) {
+  function drawPixel(
+    point: PixelPoint,
+    drawingTool: "pencil" | "eraser",
+    color: string,
+  ) {
     const canvas = canvasRef.current;
     const context = canvas?.getContext("2d");
     if (!canvas || !context) return;
 
-    if (tool === "eraser") {
+    if (drawingTool === "eraser") {
       context.clearRect(point.x, point.y, 1, 1);
       return;
     }
 
-    context.fillStyle = selectedColor;
+    context.fillStyle = color;
     context.fillRect(point.x, point.y, 1, 1);
   }
 
-  function drawLine(from: PixelPoint, to: PixelPoint) {
+  function drawLine(
+    from: PixelPoint,
+    to: PixelPoint,
+    drawingTool: "pencil" | "eraser",
+    color: string,
+  ) {
     let x = from.x;
     let y = from.y;
     const stepX = from.x < to.x ? 1 : -1;
@@ -703,7 +1029,7 @@ export function PixelEditor({
     let lineError = deltaX + deltaY;
 
     while (true) {
-      drawPixel({ x, y });
+      drawPixel({ x, y }, drawingTool, color);
       if (x === to.x && y === to.y) break;
 
       const doubledError = lineError * 2;
@@ -734,6 +1060,7 @@ export function PixelEditor({
   }
 
   function chooseColor(color: string) {
+    cancelActivePointerInteraction();
     setSelectedColor(color);
     setTool((currentTool) =>
       currentTool === "fill" ? "fill" : "pencil",
@@ -742,12 +1069,26 @@ export function PixelEditor({
   }
 
   function selectTool(nextTool: EditorTool) {
+    cancelActivePointerInteraction();
     setTool(nextTool);
     if (nextTool !== "crop") {
       setCropSelection(null);
       cropStartRef.current = null;
     }
     if (nextTool === "crop") setNotice(null);
+  }
+
+  function cancelActivePointerInteraction() {
+    const canvas = canvasRef.current;
+    const pointerId = activePointerRef.current;
+
+    if (canvas && pointerId !== null && canvas.hasPointerCapture(pointerId)) {
+      canvas.releasePointerCapture(pointerId);
+    }
+    activePointerRef.current = null;
+    activeInteractionRef.current = null;
+    lastPointRef.current = null;
+    cropStartRef.current = null;
   }
 
   function clearBulkUndo() {
@@ -785,6 +1126,7 @@ export function PixelEditor({
     if (tool === "crop") {
       cropStartRef.current = point;
       activePointerRef.current = event.pointerId;
+      activeInteractionRef.current = { kind: "crop" };
       lastPointRef.current = point;
       setCropSelection(cropFromPoints(point, point));
       event.currentTarget.setPointerCapture(event.pointerId);
@@ -800,7 +1142,12 @@ export function PixelEditor({
           return;
         }
 
-        clearBulkUndo();
+        const previousImage = context.getImageData(
+          0,
+          0,
+          canvas.width,
+          canvas.height,
+        );
         const filledPixels = floodFill(
           context,
           canvas.width,
@@ -808,6 +1155,14 @@ export function PixelEditor({
           point,
           selectedColor,
         );
+        if (filledPixels > 0) {
+          bulkUndoRef.current = {
+            image: previousImage,
+            size: { width: canvas.width, height: canvas.height },
+            crop: { ...resultCrop },
+          };
+          setCanUndoBulkEdit(true);
+        }
         setNotice(
           filledPixels > 0
             ? `FILLED ${filledPixels.toLocaleString()} PIXELS`
@@ -820,9 +1175,15 @@ export function PixelEditor({
     clearBulkUndo();
     setNotice(null);
     activePointerRef.current = event.pointerId;
+    const drawingTool = tool === "eraser" ? "eraser" : "pencil";
+    activeInteractionRef.current = {
+      kind: "draw",
+      tool: drawingTool,
+      color: selectedColor,
+    };
     lastPointRef.current = point;
     event.currentTarget.setPointerCapture(event.pointerId);
-    drawPixel(point);
+    drawPixel(point, drawingTool, selectedColor);
   }
 
   function handlePointerMove(event: ReactPointerEvent<HTMLCanvasElement>) {
@@ -838,13 +1199,22 @@ export function PixelEditor({
 
     event.preventDefault();
 
-    if (tool === "crop" && cropStartRef.current) {
+    const interaction = activeInteractionRef.current;
+    if (!interaction) return;
+
+    if (interaction.kind === "crop") {
+      if (!cropStartRef.current) return;
       setCropSelection(cropFromPoints(cropStartRef.current, point));
       lastPointRef.current = point;
       return;
     }
 
-    drawLine(lastPointRef.current, point);
+    drawLine(
+      lastPointRef.current,
+      point,
+      interaction.tool,
+      interaction.color,
+    );
     lastPointRef.current = point;
   }
 
@@ -855,6 +1225,7 @@ export function PixelEditor({
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
     activePointerRef.current = null;
+    activeInteractionRef.current = null;
     lastPointRef.current = null;
     cropStartRef.current = null;
   }
@@ -916,15 +1287,17 @@ export function PixelEditor({
     setZoom(nextZoom);
   }
 
-  function handleCanvasWheel(event: ReactWheelEvent<HTMLDivElement>) {
+  function handleCanvasWheel(event: WheelEvent) {
+    event.preventDefault();
     if (!isReady || isApplying) return;
 
-    event.preventDefault();
+    const scroller = canvasScrollRef.current;
+    if (!scroller) return;
     const deltaMultiplier =
       event.deltaMode === 1
         ? 16
         : event.deltaMode === 2
-          ? event.currentTarget.clientHeight
+          ? scroller.clientHeight
           : 1;
     wheelDeltaRef.current += event.deltaY * deltaMultiplier;
 
@@ -970,11 +1343,6 @@ export function PixelEditor({
       return;
     }
 
-    if (canvas.width * canvas.height > MAX_BULK_EDIT_PIXELS) {
-      setNotice("CROP IS LIMITED TO 4 MEGAPIXELS");
-      return;
-    }
-
     const selection = {
       x: Math.max(0, Math.min(canvas.width - 1, cropSelection.x)),
       y: Math.max(0, Math.min(canvas.height - 1, cropSelection.y)),
@@ -1003,13 +1371,24 @@ export function PixelEditor({
       return;
     }
 
+    if (selection.width * selection.height > MAX_BULK_EDIT_PIXELS) {
+      setNotice("CROP SELECTION IS LIMITED TO 4 MEGAPIXELS");
+      return;
+    }
+
     const croppedImage = context.getImageData(
       selection.x,
       selection.y,
       selection.width,
       selection.height,
     );
-    storeBulkUndo(context, canvas);
+    const canSnapshotSource =
+      canvas.width * canvas.height <= MAX_BULK_EDIT_PIXELS;
+    if (canSnapshotSource) {
+      storeBulkUndo(context, canvas);
+    } else {
+      clearBulkUndo();
+    }
     pendingCanvasImageRef.current = croppedImage;
     centerNextCanvasLayout();
     setCanvasSize({
@@ -1029,7 +1408,11 @@ export function PixelEditor({
     activePointerRef.current = null;
     lastPointRef.current = null;
     setTool("pencil");
-    setNotice(`CROPPED TO ${selection.width} × ${selection.height} PIXELS`);
+    setNotice(
+      `CROPPED TO ${selection.width} × ${selection.height} PIXELS${
+        canSnapshotSource ? "" : " · UNDO UNAVAILABLE FOR LARGE SOURCE"
+      }`,
+    );
   }
 
   async function handleApply() {
@@ -1043,13 +1426,15 @@ export function PixelEditor({
     try {
       const blob = await canvasToPng(canvas);
       nextUrl = URL.createObjectURL(blob);
-      onApply({
+      const nextResult: PixelizeResult = {
         blob,
         url: nextUrl,
         width: canvas.width,
         height: canvas.height,
         crop: resultCrop,
-      });
+        sourceGrid: result.sourceGrid,
+      };
+      onApply(nextResult);
       setIsApplying(false);
     } catch {
       if (nextUrl) URL.revokeObjectURL(nextUrl);
@@ -1092,9 +1477,11 @@ export function PixelEditor({
       );
     } else {
       setNotice(
-        removal.detected
+        removal.noOpaquePixels
           ? "NO OPAQUE BACKGROUND REMAINS"
-          : "NO UNIFORM EDGE BACKGROUND FOUND",
+          : removal.detected
+            ? "NO MATCHING EDGE BACKGROUND FOUND"
+            : "NO UNIFORM EDGE BACKGROUND FOUND",
       );
     }
     setCropSelection(null);
@@ -1129,9 +1516,9 @@ export function PixelEditor({
   function handleDialogKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (event.key === "Escape" && !isApplying) {
       event.preventDefault();
+      cancelActivePointerInteraction();
       if (cropSelection) {
         setCropSelection(null);
-        cropStartRef.current = null;
         return;
       }
       if (tool === "crop") {
@@ -1155,7 +1542,10 @@ export function PixelEditor({
 
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
+      if (document.activeElement === dialog) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && document.activeElement === first) {
         event.preventDefault();
         last.focus();
       } else if (!event.shiftKey && document.activeElement === last) {
@@ -1388,7 +1778,6 @@ export function PixelEditor({
           <div
             ref={canvasScrollRef}
             className="pixel-editor-canvas-scroll"
-            onWheel={handleCanvasWheel}
           >
             <div className="pixel-editor-canvas-stage">
               <div
@@ -1408,17 +1797,12 @@ export function PixelEditor({
                   onPointerUp={finishPointer}
                   onPointerCancel={finishPointer}
                 />
-                <img
-                  alt=""
+                <canvas
                   aria-hidden="true"
                   className={`pixel-editor-original-overlay ${
                     showOriginal ? "is-visible" : ""
                   }`}
-                  draggable="false"
-                  height={sourceHeight}
-                  src={sourceUrl}
-                  style={originalOverlayStyle}
-                  width={sourceWidth}
+                  ref={originalOverlayRef}
                 />
                 {cropSelection && (
                   <div

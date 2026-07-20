@@ -34,31 +34,15 @@ function colorDistance(
 }
 
 /**
- * Builds a compact, diverse palette from representative colors in the source.
- * Colors are quantized only for grouping; each swatch uses the source pixels'
- * average color within its bucket.
+ * Builds a compact, diverse palette directly from pixel data. The function is
+ * intentionally free of DOM APIs so it can run in either the main thread or an
+ * image-processing worker.
  */
-export function extractImagePalette(
-  image: HTMLImageElement,
+export function extractPaletteFromImageData(
+  imageData: ImageData,
   maximumColors = 24,
-) {
-  const scale = Math.min(
-    1,
-    PALETTE_ANALYSIS_SIZE /
-      Math.max(image.naturalWidth, image.naturalHeight),
-  );
-  const width = Math.max(1, Math.round(image.naturalWidth * scale));
-  const height = Math.max(1, Math.round(image.naturalHeight * scale));
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const context = canvas.getContext("2d", { willReadFrequently: true });
-
-  if (!context) return ["#000000", "#ffffff"];
-
-  context.imageSmoothingEnabled = true;
-  context.drawImage(image, 0, 0, width, height);
-  const pixels = context.getImageData(0, 0, width, height).data;
+): string[] {
+  const pixels = imageData.data;
   const buckets = new Map<number, ColorBucket>();
 
   for (let offset = 0; offset < pixels.length; offset += 4) {
@@ -151,4 +135,34 @@ export function extractImagePalette(
   }
 
   return selected.map((color) => toHex(color.red, color.green, color.blue));
+}
+
+/**
+ * Builds a compact, diverse palette from representative colors in the source.
+ * Colors are quantized only for grouping; each swatch uses the source pixels'
+ * average color within its bucket.
+ */
+export function extractImagePalette(
+  image: HTMLImageElement,
+  maximumColors = 24,
+): string[] {
+  const scale = Math.min(
+    1,
+    PALETTE_ANALYSIS_SIZE /
+      Math.max(image.naturalWidth, image.naturalHeight),
+  );
+  const width = Math.max(1, Math.round(image.naturalWidth * scale));
+  const height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+
+  if (!context) return ["#000000", "#ffffff"];
+
+  context.imageSmoothingEnabled = true;
+  context.drawImage(image, 0, 0, width, height);
+  const imageData = context.getImageData(0, 0, width, height);
+
+  return extractPaletteFromImageData(imageData, maximumColors);
 }
