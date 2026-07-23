@@ -880,14 +880,9 @@ function App() {
 
       <main className="workspace">
         <section className="intro">
-          <p className="eyebrow">
-            <span>01</span>
-            TRUE PIXEL CONVERTER
-          </p>
+          <p className="eyebrow">TRUE PIXEL CONVERTER</p>
           <h1>
-            Turn almost-pixels
-            <br />
-            into <em>actual pixels.</em>
+            Turn almost-pixels into <em>actual pixels.</em>
           </h1>
           <p className="intro-copy">
             Detect the hidden grid in AI-generated pixel art, then rebuild it
