@@ -1,6 +1,7 @@
 import type {
   PixelGridDetection,
   PixelGridSettings,
+  PixelGridSuggestion,
 } from "./gridDetection";
 import type { CellRange } from "./pixelizeCore";
 
@@ -17,6 +18,7 @@ export type AnalyzeImageResult = {
   sourceWidth: number;
   sourceHeight: number;
   detection: PixelGridDetection;
+  suggestion: PixelGridSuggestion | null;
   palette: string[];
 };
 

@@ -11,6 +11,12 @@ export type PixelGridSettings = {
   offsetY: number;
 };
 
+export type PixelGridSuggestion = {
+  pixelSize: number;
+  confidence: number;
+  alternatives: number[];
+};
+
 export type PixelBuffer = {
   width: number;
   height: number;
@@ -59,6 +65,7 @@ const MIN_FINAL_SCORE = 0.19;
 const MIN_BOUNDARY_SUPPORT = 0.68;
 const MIN_INTERIOR_FLATNESS = 0.22;
 const MIN_RELIABLE_ANALYSIS_PITCH = 2.95;
+const MIN_ADVISORY_SOURCE_DIMENSION = 480;
 const EPSILON = 1e-7;
 const axisPeakCache = new WeakMap<AxisEnergy, number[]>();
 const axisStatisticsCache = new WeakMap<
@@ -1103,4 +1110,717 @@ export function detectPixelGridData(
     offsetX,
     offsetY,
   };
+}
+
+type AdvisoryAxisEvidence = {
+  nearFraction: number;
+  flatFraction: number;
+  strongFraction: number;
+  gaps: number[];
+};
+
+type AdvisoryPeriodEvidence = {
+  contrast: number;
+  coherentWindows: number;
+};
+
+type AdvisoryCandidate = {
+  pixelSize: number;
+  score: number;
+  phaseStrength: number;
+  gapSupport: number;
+};
+
+function canAnalyzeAdvisoryGrid(
+  image: PixelBuffer,
+  sourceWidth: number,
+  sourceHeight: number,
+) {
+  return (
+    image.width >= 24 &&
+    image.height >= 24 &&
+    image.data.length >= image.width * image.height * 4 &&
+    Number.isFinite(sourceWidth) &&
+    Number.isFinite(sourceHeight) &&
+    sourceWidth >= MIN_ADVISORY_SOURCE_DIMENSION &&
+    sourceHeight >= MIN_ADVISORY_SOURCE_DIMENSION
+  );
+}
+
+/**
+ * The strict detector deliberately refuses images whose source-pixel grid is
+ * not globally repeatable. AI-generated "pixel art" often falls into that
+ * category: it contains short plateaus and staircase gaps at a plausible
+ * scale, but the phase drifts around the scene.
+ *
+ * This secondary detector is intentionally advisory. It combines weak local
+ * block/stair evidence with a two-axis phase spectrum and returns only a
+ * ranked manual starting point. It never changes the strict detector's result.
+ */
+export function suggestPixelGridData(
+  image: PixelBuffer,
+  sourceWidth = image.width,
+  sourceHeight = image.height,
+): PixelGridSuggestion | null {
+  // At thumbnail scale, HEIC/JPEG quantization frequently creates convincing
+  // 3–8px plateaus in ordinary photographs. V1 therefore withholds advisory
+  // guesses below 480px on either source axis; manual controls remain
+  // available, while strict detections are handled independently upstream.
+  if (!canAnalyzeAdvisoryGrid(image, sourceWidth, sourceHeight)) {
+    return null;
+  }
+
+  // A strict result is always preferable and must remain the only automatic
+  // result. In particular, do not "improve" or second-guess a low-confidence
+  // strict pitch here.
+  const strict = detectPixelGridData(image, sourceWidth, sourceHeight);
+  if (strict.pixelSize > 1 || strict.confidence > 0) return null;
+
+  return suggestPixelGridAfterStrictFailureData(
+    image,
+    sourceWidth,
+    sourceHeight,
+  );
+}
+
+/**
+ * Combined strict/advisory analysis for trusted rasterization call sites.
+ * Keeping this orchestration beside the detectors avoids running the strict
+ * pass twice while the standalone suggestion API remains independently safe.
+ */
+export function analyzePixelGridData(
+  image: PixelBuffer,
+  sourceWidth = image.width,
+  sourceHeight = image.height,
+): {
+  detection: PixelGridDetection;
+  suggestion: PixelGridSuggestion | null;
+} {
+  const detection = detectPixelGridData(image, sourceWidth, sourceHeight);
+  const strictFailed =
+    detection.pixelSize === 1 && detection.confidence === 0;
+  const suggestion =
+    strictFailed && canAnalyzeAdvisoryGrid(image, sourceWidth, sourceHeight)
+      ? suggestPixelGridAfterStrictFailureData(
+          image,
+          sourceWidth,
+          sourceHeight,
+        )
+      : null;
+
+  return { detection, suggestion };
+}
+
+function suggestPixelGridAfterStrictFailureData(
+  image: PixelBuffer,
+  sourceWidth: number,
+  sourceHeight: number,
+): PixelGridSuggestion | null {
+  const visual = advisoryVisualEvidence(
+    image,
+    sourceWidth,
+    sourceHeight,
+  );
+  if (!visual) return null;
+
+  const fullRegion: AnalysisRegion = {
+    left: 0,
+    top: 0,
+    right: image.width,
+    bottom: image.height,
+    foregroundMask: null,
+    anchorX: 0,
+    anchorY: 0,
+    hasLightNeutralCanvas: false,
+  };
+  const xEnergy = verticalEnergy(image, fullRegion);
+  const yEnergy = horizontalEnergy(image, fullRegion);
+  const scaleX = image.width / sourceWidth;
+  const scaleY = image.height / sourceHeight;
+  const maximumSourcePitch = Math.min(
+    8,
+    Math.floor(Math.min(sourceWidth, sourceHeight) / 24),
+  );
+  const ranked: AdvisoryCandidate[] = [];
+
+  // Below roughly 2.6 analysis pixels, downsampling has destroyed too much
+  // within-cell evidence for a useful manual suggestion. The strict detector
+  // handles larger, globally regular grids; this deliberately narrow search
+  // is for the messy 3–8px pseudo-pixel range. Larger weak periods are very
+  // often content harmonics; genuinely enlarged pixels at those scales are
+  // already observable by the strict detector.
+  for (let pixelSize = 3; pixelSize <= maximumSourcePitch; pixelSize += 1) {
+    const analysisPitchX = pixelSize * scaleX;
+    const analysisPitchY = pixelSize * scaleY;
+    if (Math.min(analysisPitchX, analysisPitchY) < 2.6) continue;
+
+    const xPeriod = advisoryPeriodEvidence(xEnergy, analysisPitchX);
+    const yPeriod = advisoryPeriodEvidence(yEnergy, analysisPitchY);
+    const weakestContrast = Math.min(xPeriod.contrast, yPeriod.contrast);
+    const phaseStrength = Math.sqrt(
+      xPeriod.contrast * yPeriod.contrast,
+    );
+    if (weakestContrast < 0.012 || phaseStrength < 0.026) continue;
+
+    const dimensionFit = advisoryDimensionFit(
+      sourceWidth,
+      sourceHeight,
+      pixelSize,
+    );
+    const gapSupport =
+      (advisoryGapSupport(visual.x.gaps, pixelSize) +
+        advisoryGapSupport(visual.y.gaps, pixelSize)) /
+      2;
+    const windowCoherence = Math.min(
+      xPeriod.coherentWindows,
+      yPeriod.coherentWindows,
+    );
+
+    // Dimension divisibility is useful for generated images (the requested
+    // room is 543x181 logical pixels at 4px), but it is only a bounded
+    // tie-breaker. A photo with convenient dimensions still needs all of the
+    // independent pixel/block evidence above.
+    const score =
+      phaseStrength * 0.72 +
+      weakestContrast * 0.18 +
+      gapSupport * 0.035 +
+      windowCoherence * 0.008 +
+      dimensionFit * 0.004 -
+      Math.max(0, pixelSize - 4) * 0.004;
+
+    ranked.push({ pixelSize, score, phaseStrength, gapSupport });
+  }
+
+  ranked.sort((first, second) => second.score - first.score);
+  const phaseLeader = ranked[0];
+  const gapLeader = [...ranked].sort(
+    (first, second) => second.gapSupport - first.gapSupport,
+  )[0];
+  // A drifting 3px grid can alias into a much stronger 8px collapsed-axis
+  // phase even though its observed two-dimensional step gaps overwhelmingly
+  // support 3px. Promote that local-gap leader only when the evidence ratio is
+  // decisive; the real room's nearby 3/4px scores are intentionally unaffected.
+  const best =
+    phaseLeader &&
+    gapLeader &&
+    gapLeader.gapSupport >= 0.55 &&
+    gapLeader.gapSupport >= phaseLeader.gapSupport * 2.2 &&
+    gapLeader.score >= phaseLeader.score * 0.42
+      ? gapLeader
+      : phaseLeader;
+  if (!best || best.score < 0.034 || best.phaseStrength < 0.026) return null;
+
+  const selectedRanking = [
+    best,
+    ...ranked.filter(({ pixelSize }) => pixelSize !== best.pixelSize),
+  ];
+  const runnerUp = selectedRanking[1];
+  const separation = runnerUp ? Math.max(0, best.score - runnerUp.score) : 0.02;
+  const flatness = Math.min(
+    visual.x.flatFraction,
+    visual.y.flatFraction,
+  );
+  const edgeBalance =
+    Math.min(visual.x.strongFraction, visual.y.strongFraction) /
+    Math.max(visual.x.strongFraction, visual.y.strongFraction);
+  const confidence = Math.round(
+    18 +
+      clamp01((best.phaseStrength - 0.026) / 0.09) * 14 +
+      clamp01((flatness - 0.16) / 0.34) * 8 +
+      edgeBalance * 4 +
+      clamp01(separation / 0.035) * 8,
+  );
+
+  const alternatives = selectedRanking
+    .slice(1)
+    .filter((candidate) => candidate.score >= best.score * 0.58)
+    .slice(0, 3)
+    .map((candidate) => candidate.pixelSize);
+
+  // At this weak-evidence boundary, 3px is the meaningful oversampling
+  // alternative to a 4px suggestion. Keep it visible even if a content
+  // harmonic narrowly outranks it.
+  const threePixel = ranked.find(({ pixelSize }) => pixelSize === 3);
+  if (
+    best.pixelSize === 4 &&
+    threePixel &&
+    threePixel.score >= best.score * 0.55 &&
+    !alternatives.includes(3)
+  ) {
+    alternatives.unshift(3);
+    alternatives.length = Math.min(alternatives.length, 3);
+  }
+
+  return {
+    pixelSize: best.pixelSize,
+    confidence: Math.max(1, Math.min(35, confidence)),
+    alternatives,
+  };
+}
+
+function advisoryVisualEvidence(
+  image: PixelBuffer,
+  sourceWidth: number,
+  sourceHeight: number,
+) {
+  const { width, height, data } = image;
+  const sampleStride = Math.max(
+    1,
+    Math.ceil(Math.sqrt((width * height) / 280_000)),
+  );
+  const palette = new Set<number>();
+  const x = {
+    samples: 0,
+    near: 0,
+    flat: 0,
+    strong: 0,
+  };
+  const y = {
+    samples: 0,
+    near: 0,
+    flat: 0,
+    strong: 0,
+  };
+
+  forEachAdvisorySample(width, height, sampleStride, (row, column) => {
+    const offset = (row * width + column) * 4;
+    const paletteKey =
+      (data[offset] >> 4) |
+      ((data[offset + 1] >> 4) << 4) |
+      ((data[offset + 2] >> 4) << 8) |
+      ((data[offset + 3] >> 6) << 12);
+    palette.add(paletteKey);
+
+    if (column > 0) {
+      accumulateAdvisoryDifference(
+        x,
+        colorDistance(data, offset - 4, offset),
+      );
+    }
+    if (row > 0) {
+      accumulateAdvisoryDifference(
+        y,
+        colorDistance(data, offset - width * 4, offset),
+      );
+    }
+  });
+
+  const xEvidence = finishAdvisoryAxisEvidence(
+    x,
+    advisoryEdgeGaps(image, "x", sourceWidth / width),
+  );
+  const yEvidence = finishAdvisoryAxisEvidence(
+    y,
+    advisoryEdgeGaps(image, "y", sourceHeight / height),
+  );
+  const edgeTopology = advisoryEdgeTopology(image, sampleStride);
+  const patchConsensus = advisoryPatchConsensus(image, sampleStride);
+  const paletteLimit = Math.min(
+    3_600,
+    Math.max(128, Math.round((x.samples + y.samples) * 0.018)),
+  );
+
+  // These are image-class gates, not pitch gates:
+  // - gradients/codecs lack a meaningful strong-edge tail,
+  // - photos/noise lack repeated near-flat plateaus and a compact palette,
+  // - stripes have essentially no edge evidence on one axis,
+  // - text, barcodes, and floorplans lack diverse, edge-active 2D patches.
+  if (
+    xEvidence.nearFraction < 0.56 ||
+    yEvidence.nearFraction < 0.56 ||
+    xEvidence.flatFraction < 0.16 ||
+    yEvidence.flatFraction < 0.16 ||
+    xEvidence.strongFraction < 0.012 ||
+    yEvidence.strongFraction < 0.012 ||
+    xEvidence.strongFraction > 0.34 ||
+    yEvidence.strongFraction > 0.34 ||
+    palette.size > paletteLimit ||
+    patchConsensus.richTiles < 4 ||
+    patchConsensus.richFraction < 0.5 ||
+    edgeTopology.axisAlignment < 0.58 ||
+    edgeTopology.persistence < 0.89 ||
+    xEvidence.gaps.length < 20 ||
+    yEvidence.gaps.length < 20
+  ) {
+    return null;
+  }
+
+  return { x: xEvidence, y: yEvidence };
+}
+
+function forEachAdvisorySample(
+  width: number,
+  height: number,
+  stride: number,
+  visitor: (row: number, column: number) => void,
+) {
+  let rowIndex = 0;
+  for (
+    let rowStart = 0;
+    rowStart < height;
+    rowStart += stride, rowIndex += 1
+  ) {
+    const row = Math.min(
+      height - 1,
+      rowStart + positiveModulo(rowIndex, stride),
+    );
+    let columnIndex = 0;
+    for (
+      let columnStart = 0;
+      columnStart < width;
+      columnStart += stride, columnIndex += 1
+    ) {
+      const column = Math.min(
+        width - 1,
+        columnStart +
+          positiveModulo(columnIndex + rowIndex * 3, stride),
+      );
+      visitor(row, column);
+    }
+  }
+}
+
+function advisoryPatchConsensus(image: PixelBuffer, stride: number) {
+  const { width, height, data } = image;
+  const tileSize = 32;
+  const tileColumns = Math.ceil(width / tileSize);
+  const tileRows = Math.ceil(height / tileSize);
+  const samples = new Uint16Array(tileColumns * tileRows);
+  const strongX = new Uint16Array(samples.length);
+  const strongY = new Uint16Array(samples.length);
+  const histograms: Array<Map<number, number> | undefined> = new Array(
+    samples.length,
+  );
+
+  forEachAdvisorySample(width, height, stride, (row, column) => {
+    const offset = (row * width + column) * 4;
+    const tile =
+      Math.floor(row / tileSize) * tileColumns +
+      Math.floor(column / tileSize);
+    const colorKey =
+      (data[offset] >> 4) |
+      ((data[offset + 1] >> 4) << 4) |
+      ((data[offset + 2] >> 4) << 8);
+    const histogram = histograms[tile] ?? new Map<number, number>();
+    histograms[tile] = histogram;
+    histogram.set(colorKey, (histogram.get(colorKey) ?? 0) + 1);
+    samples[tile] += 1;
+    if (
+      column > 0 &&
+      colorDistance(data, offset - 4, offset) >= 16
+    ) {
+      strongX[tile] += 1;
+    }
+    if (
+      row > 0 &&
+      colorDistance(data, offset - width * 4, offset) >= 16
+    ) {
+      strongY[tile] += 1;
+    }
+  });
+
+  let activeTiles = 0;
+  let richTiles = 0;
+  for (let tile = 0; tile < samples.length; tile += 1) {
+    if (samples[tile] < 4 || strongX[tile] < 2 || strongY[tile] < 2) {
+      continue;
+    }
+    activeTiles += 1;
+
+    let entropy = 0;
+    for (const count of histograms[tile]?.values() ?? []) {
+      const probability = count / samples[tile];
+      entropy -= probability * Math.log2(probability);
+    }
+    if (entropy >= 1.5) richTiles += 1;
+  }
+
+  return {
+    richTiles,
+    richFraction: richTiles / Math.max(1, activeTiles),
+  };
+}
+
+/**
+ * Generated pseudo-pixels preserve long horizontal/vertical edge fragments
+ * even when their grid phase wanders. Natural photographic contours produce
+ * paired x/y gradients and slide across neighboring scanlines instead. This
+ * topology gate is substantially more discriminating than flat-pixel counts
+ * alone (which skies and compressed thumbnails can also satisfy).
+ */
+function advisoryEdgeTopology(image: PixelBuffer, stride: number) {
+  const { width, height, data } = image;
+  let strongPixels = 0;
+  let axisAlignedPixels = 0;
+  let strongComponents = 0;
+  let persistentComponents = 0;
+
+  forEachAdvisorySample(width, height, stride, (row, column) => {
+    if (row === 0 || column === 0) return;
+    const offset = (row * width + column) * 4;
+    const xDifference = colorDistance(data, offset - 4, offset);
+    const yDifference = colorDistance(data, offset - width * 4, offset);
+    const strongest = Math.max(xDifference, yDifference);
+    const weakest = Math.min(xDifference, yDifference);
+
+    if (strongest >= 16) {
+      strongPixels += 1;
+      if (weakest <= 3 || weakest / strongest <= 0.22) {
+        axisAlignedPixels += 1;
+      }
+    }
+
+    if (xDifference >= 16) {
+      strongComponents += 1;
+      const above = offset - width * 4;
+      const below = offset + width * 4;
+      const persistsAbove =
+        row > 1 && colorDistance(data, above - 4, above) >= 16;
+      const persistsBelow =
+        row + 1 < height && colorDistance(data, below - 4, below) >= 16;
+      if (persistsAbove || persistsBelow) persistentComponents += 1;
+    }
+
+    if (yDifference >= 16) {
+      strongComponents += 1;
+      const left = offset - 4;
+      const right = offset + 4;
+      const persistsLeft =
+        column > 1 && colorDistance(data, left - width * 4, left) >= 16;
+      const persistsRight =
+        column + 1 < width &&
+        colorDistance(data, right - width * 4, right) >= 16;
+      if (persistsLeft || persistsRight) persistentComponents += 1;
+    }
+  });
+
+  return {
+    axisAlignment: axisAlignedPixels / Math.max(1, strongPixels),
+    persistence: persistentComponents / Math.max(1, strongComponents),
+  };
+}
+
+function accumulateAdvisoryDifference(
+  accumulator: {
+    samples: number;
+    near: number;
+    flat: number;
+    strong: number;
+  },
+  difference: number,
+) {
+  accumulator.samples += 1;
+  if (difference <= 6) accumulator.near += 1;
+  if (difference <= 1) accumulator.flat += 1;
+  if (difference >= 16) accumulator.strong += 1;
+}
+
+function finishAdvisoryAxisEvidence(
+  accumulator: {
+    samples: number;
+    near: number;
+    flat: number;
+    strong: number;
+  },
+  gaps: number[],
+): AdvisoryAxisEvidence {
+  return {
+    nearFraction: accumulator.near / Math.max(1, accumulator.samples),
+    flatFraction: accumulator.flat / Math.max(1, accumulator.samples),
+    strongFraction: accumulator.strong / Math.max(1, accumulator.samples),
+    gaps,
+  };
+}
+
+function advisoryEdgeGaps(
+  image: PixelBuffer,
+  axis: "x" | "y",
+  sourceScale: number,
+) {
+  const { width, height, data } = image;
+  const lineCount = axis === "x" ? height : width;
+  const lineLength = axis === "x" ? width : height;
+  const lineStride = Math.max(1, Math.ceil(lineCount / 96));
+  const gaps: number[] = [];
+
+  for (let line = 0; line < lineCount; line += lineStride) {
+    let bandStart = -1;
+    let bandEnd = -1;
+    let previousCenter = -1;
+
+    const finishBand = () => {
+      if (bandStart < 0) return;
+      const center = (bandStart + bandEnd) / 2;
+      if (previousCenter >= 0) {
+        const sourceGap = (center - previousCenter) * sourceScale;
+        if (sourceGap >= 1.5 && sourceGap <= 48) gaps.push(sourceGap);
+      }
+      previousCenter = center;
+      bandStart = -1;
+      bandEnd = -1;
+    };
+
+    for (let coordinate = 1; coordinate < lineLength; coordinate += 1) {
+      const column = axis === "x" ? coordinate : line;
+      const row = axis === "x" ? line : coordinate;
+      const offset = (row * width + column) * 4;
+      const previousOffset =
+        axis === "x" ? offset - 4 : offset - width * 4;
+      const isEdge = colorDistance(data, previousOffset, offset) >= 16;
+
+      if (!isEdge) {
+        finishBand();
+      } else if (bandStart < 0) {
+        bandStart = coordinate;
+        bandEnd = coordinate;
+      } else {
+        bandEnd = coordinate;
+      }
+    }
+    finishBand();
+  }
+
+  return gaps;
+}
+
+function advisoryGapSupport(gaps: number[], pitch: number) {
+  if (gaps.length === 0) return 0;
+  let directSupport = 0;
+  let multipleSupport = 0;
+  let eligible = 0;
+
+  for (const gap of gaps) {
+    if (gap < pitch * 0.55 || gap > pitch * 6.4) continue;
+    eligible += 1;
+    const nearestMultiple = Math.max(1, Math.round(gap / pitch));
+    const multipleError = Math.abs(gap - nearestMultiple * pitch);
+    const tolerance = 0.58 + nearestMultiple * 0.05;
+    multipleSupport += Math.exp(-0.5 * (multipleError / tolerance) ** 2);
+
+    const directError = Math.abs(gap - pitch);
+    directSupport += Math.exp(-0.5 * (directError / 0.72) ** 2);
+  }
+
+  if (eligible < 12) return 0;
+  const rawSupport =
+    (multipleSupport / eligible) * 0.68 +
+    (directSupport / eligible) * 0.32;
+
+  // A smaller pitch can explain almost any observed gap as one of many
+  // multiples. Normalize that combinatorial advantage before the gap spectrum
+  // participates in ranking.
+  return clamp01(rawSupport * Math.max(0.75, Math.min(1.5, pitch / 4)));
+}
+
+function advisoryPeriodEvidence(
+  axis: AxisEnergy,
+  pitch: number,
+): AdvisoryPeriodEvidence {
+  const { values, coordinateStart } = axis;
+  if (pitch < 2.6 || values.length < pitch * 8) {
+    return { contrast: 0, coherentWindows: 0 };
+  }
+
+  const statistics = signalStatistics(values);
+  if (statistics.mean < 0.35 || statistics.deviation < 0.08) {
+    return { contrast: 0, coherentWindows: 0 };
+  }
+
+  const boundaryWidth = Math.min(0.78, pitch * 0.2);
+  let bestContrast = 0;
+  let bestOffset = 0;
+  const offsetSteps = Math.max(12, Math.ceil(pitch * 6));
+
+  for (let step = 0; step < offsetSteps; step += 1) {
+    const offset = (step / offsetSteps) * pitch;
+    const contrast = advisoryPhaseContrast(
+      values,
+      coordinateStart,
+      pitch,
+      offset,
+      boundaryWidth,
+      0,
+      values.length,
+    );
+    if (contrast > bestContrast) {
+      bestContrast = contrast;
+      bestOffset = offset;
+    }
+  }
+
+  const windowLength = Math.max(48, Math.round(pitch * 14));
+  let windows = 0;
+  let coherent = 0;
+  for (
+    let start = 0;
+    start + Math.max(24, pitch * 7) <= values.length;
+    start += windowLength
+  ) {
+    const end = Math.min(values.length, start + windowLength);
+    const contrast = advisoryPhaseContrast(
+      values,
+      coordinateStart,
+      pitch,
+      bestOffset,
+      boundaryWidth,
+      start,
+      end,
+    );
+    windows += 1;
+    if (contrast >= Math.max(0.006, bestContrast * 0.18)) coherent += 1;
+  }
+
+  return {
+    contrast: Math.max(0, bestContrast),
+    coherentWindows: coherent / Math.max(1, windows),
+  };
+}
+
+function advisoryPhaseContrast(
+  values: Float32Array,
+  coordinateStart: number,
+  pitch: number,
+  offset: number,
+  boundaryWidth: number,
+  start: number,
+  end: number,
+) {
+  let boundaryEnergy = 0;
+  let boundarySamples = 0;
+  let interiorEnergy = 0;
+  let interiorSamples = 0;
+
+  for (let index = start; index < end; index += 1) {
+    const coordinate = coordinateStart + index;
+    if (phaseDistance(coordinate, pitch, offset) <= boundaryWidth) {
+      boundaryEnergy += values[index];
+      boundarySamples += 1;
+    } else {
+      interiorEnergy += values[index];
+      interiorSamples += 1;
+    }
+  }
+
+  if (boundarySamples < 2 || interiorSamples < 4) return 0;
+  const boundaryMean = boundaryEnergy / boundarySamples;
+  const interiorMean = interiorEnergy / interiorSamples;
+  return Math.max(
+    0,
+    (boundaryMean - interiorMean) /
+      Math.max(0.5, (boundaryMean + interiorMean) / 2),
+  );
+}
+
+function advisoryDimensionFit(
+  width: number,
+  height: number,
+  pitch: number,
+) {
+  const remainderDistance = (length: number) => {
+    const remainder = positiveModulo(length, pitch);
+    return Math.min(remainder, pitch - remainder);
+  };
+  const distance =
+    (remainderDistance(width) + remainderDistance(height)) / 2;
+  return clamp01(1 - distance / Math.min(2.5, pitch * 0.5));
 }

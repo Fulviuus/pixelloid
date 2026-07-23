@@ -30,10 +30,11 @@ import {
   shouldFallbackFromImageWorker,
 } from "./lib/imageWorkerClient";
 import {
-  detectPixelGrid,
+  analyzePixelGrid,
   getPixelGridDimensions,
   pixelizeImage,
   PixelizeResult,
+  type PixelGridSuggestion,
 } from "./lib/pixelize";
 import { extractImagePalette } from "./lib/palette";
 import "./App.css";
@@ -53,6 +54,8 @@ type DetectedGridSetting = {
   offsetY: number;
   confidence: number;
 };
+
+type SuggestionDecision = "available" | "accepted" | "rejected";
 
 const ACCEPTED_IMAGE_TYPES = [
   "image/png",
@@ -237,6 +240,46 @@ function prepareDetectedGrid(
   return { active: detected, detected };
 }
 
+function prepareGridSuggestion(
+  suggestion: PixelGridSuggestion | null,
+  width: number,
+  height: number,
+) {
+  if (
+    !suggestion ||
+    !Number.isFinite(suggestion.pixelSize) ||
+    !Number.isFinite(suggestion.confidence) ||
+    !Array.isArray(suggestion.alternatives)
+  ) {
+    return null;
+  }
+
+  const maximum = maximumPixelSize(width, height);
+  const pixelSize = roundGridValue(suggestion.pixelSize);
+
+  // Suggestions are optional escape hatches, so reject malformed or clamped
+  // values instead of silently changing what the detector proposed.
+  if (
+    pixelSize <= 1 + GRID_VALUE_EPSILON ||
+    pixelSize > maximum ||
+    Math.abs(pixelSize - suggestion.pixelSize) > GRID_VALUE_EPSILON
+  ) {
+    return null;
+  }
+
+  return {
+    pixelSize,
+    confidence: Math.round(Math.max(0, Math.min(100, suggestion.confidence))),
+    alternatives: suggestion.alternatives
+      .filter((candidate: number) => Number.isFinite(candidate))
+      .map(roundGridValue)
+      .filter(
+        (candidate) =>
+          candidate > 1 + GRID_VALUE_EPSILON && candidate <= maximum,
+      ),
+  } satisfies PixelGridSuggestion;
+}
+
 function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const loadGenerationRef = useRef(0);
@@ -244,6 +287,9 @@ function App() {
   const workerFallbackFileRef = useRef<File | null>(null);
   const sourceRef = useRef<SourceImage | null>(null);
   const resultRef = useRef<PixelizeResult | null>(null);
+  const suggestionPrimaryActionRef = useRef<HTMLButtonElement | null>(null);
+  const suggestionFollowupActionRef = useRef<HTMLButtonElement | null>(null);
+  const suggestionFocusRequestRef = useRef(false);
   const [source, setSource] = useState<SourceImage | null>(null);
   const [result, setResult] = useState<PixelizeResult | null>(null);
   const [pixelSize, setPixelSize] = useState(8);
@@ -251,6 +297,13 @@ function App() {
   const [confidence, setConfidence] = useState<number | null>(null);
   const [detectedGrid, setDetectedGrid] =
     useState<DetectedGridSetting | null>(null);
+  const [gridSuggestion, setGridSuggestion] =
+    useState<PixelGridSuggestion | null>(null);
+  const [suggestionDecision, setSuggestionDecision] =
+    useState<SuggestionDecision | null>(null);
+  const [acceptedSuggestionPixelSize, setAcceptedSuggestionPixelSize] =
+    useState<number | null>(null);
+  const [strictDetectionFailed, setStrictDetectionFailed] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -279,6 +332,35 @@ function App() {
       offsetY: gridOffset.y,
     });
   }, [gridOffset, pixelSize, source]);
+
+  const suggestionCandidates = useMemo(() => {
+    if (!source || !gridSuggestion) return [];
+
+    const pitches = [
+      gridSuggestion.pixelSize,
+      ...gridSuggestion.alternatives,
+    ].filter(
+      (candidate, index, values) =>
+        values.findIndex(
+          (value) => Math.abs(value - candidate) < GRID_VALUE_EPSILON,
+        ) === index,
+    );
+
+    return pitches.slice(0, 3).map((candidate) => {
+      const dimensions = getPixelGridDimensions(source.width, source.height, {
+        pixelSize: candidate,
+        offsetX: 0,
+        offsetY: 0,
+      });
+
+      return {
+        pixelSize: candidate,
+        width: dimensions.width,
+        height: dimensions.height,
+      };
+    });
+  }, [gridSuggestion, source]);
+  const suggestionOutputSize = suggestionCandidates[0] ?? null;
 
   function replaceSource(nextSource: SourceImage | null) {
     const previous = sourceRef.current;
@@ -336,6 +418,17 @@ function App() {
     return () => window.removeEventListener("keydown", handleShortcut);
   }, []);
 
+  useEffect(() => {
+    if (!suggestionFocusRequestRef.current) return;
+    suggestionFocusRequestRef.current = false;
+
+    const nextTarget =
+      suggestionDecision === "available"
+        ? suggestionPrimaryActionRef.current
+        : suggestionFollowupActionRef.current;
+    nextTarget?.focus();
+  }, [suggestionDecision]);
+
   async function loadFile(file: File) {
     if (!isAcceptedImageFile(file)) {
       setError("Choose a PNG, JPG, WebP, GIF, AVIF, or BMP image.");
@@ -346,6 +439,7 @@ function App() {
     conversionGenerationRef.current += 1;
     resetImageWorkerClient("A newer image was selected.");
     workerFallbackFileRef.current = null;
+    suggestionFocusRequestRef.current = false;
     setError(null);
     setIsAnalyzing(true);
     setIsProcessing(false);
@@ -416,8 +510,9 @@ function App() {
         width: image.naturalWidth,
         height: image.naturalHeight,
       };
-      let detection;
-      let palette;
+      let detection: ReturnType<typeof analyzePixelGrid>["detection"];
+      let suggestion: PixelGridSuggestion | null;
+      let palette: string[];
       const worker = getImageWorkerClient();
 
       if (worker) {
@@ -428,6 +523,7 @@ function App() {
             maximumColors: 24,
           });
           detection = analysis.detection;
+          suggestion = analysis.suggestion;
           palette = analysis.palette;
         } catch (workerError) {
           if (
@@ -438,11 +534,15 @@ function App() {
           }
 
           workerFallbackFileRef.current = processingFile;
-          detection = detectPixelGrid(image);
+          const analysis = analyzePixelGrid(image);
+          detection = analysis.detection;
+          suggestion = analysis.suggestion;
           palette = extractImagePalette(image);
         }
       } else {
-        detection = detectPixelGrid(image);
+        const analysis = analyzePixelGrid(image);
+        detection = analysis.detection;
+        suggestion = analysis.suggestion;
         palette = extractImagePalette(image);
       }
       const preparedGrid = prepareDetectedGrid(
@@ -450,6 +550,10 @@ function App() {
         loaded.width,
         loaded.height,
       );
+      const preparedSuggestion =
+        preparedGrid.detected === null
+          ? prepareGridSuggestion(suggestion, loaded.width, loaded.height)
+          : null;
 
       if (generation !== loadGenerationRef.current) {
         revokePendingSourceUrls();
@@ -464,6 +568,10 @@ function App() {
       });
       setConfidence(preparedGrid.active.confidence);
       setDetectedGrid(preparedGrid.detected);
+      setGridSuggestion(preparedSuggestion);
+      setSuggestionDecision(preparedSuggestion ? "available" : null);
+      setAcceptedSuggestionPixelSize(null);
+      setStrictDetectionFailed(preparedGrid.detected === null);
       setSourcePalette(palette);
     } catch (caughtError) {
       revokePendingSourceUrls();
@@ -510,13 +618,17 @@ function App() {
     }
   }
 
-  function updatePixelSize(nextSize: number) {
+  function updatePixelSize(
+    nextSize: number,
+    options: { forceManual?: boolean } = {},
+  ) {
     if (!source) return;
     const maximum = maximumPixelSize(source.width, source.height);
     const clampedSize = roundGridValue(
       Math.max(1, Math.min(maximum, nextSize)),
     );
     const restoresDetection =
+      !options.forceManual &&
       detectedGrid !== null &&
       Math.abs(clampedSize - detectedGrid.pixelSize) < GRID_VALUE_EPSILON;
     const nextOffset = restoresDetection
@@ -541,6 +653,10 @@ function App() {
     setPixelSize(clampedSize);
     setGridOffset(nextOffset);
     setConfidence(nextConfidence);
+    setSuggestionDecision((current) =>
+      current === null ? null : "available",
+    );
+    setAcceptedSuggestionPixelSize(null);
     setIsEditorOpen(false);
     replaceResult(null);
   }
@@ -565,6 +681,35 @@ function App() {
     }
 
     updatePixelSize(target);
+  }
+
+  function acceptGridSuggestion(candidatePixelSize: number) {
+    const candidate = suggestionCandidates.find(
+      ({ pixelSize: availablePixelSize }) =>
+        Math.abs(availablePixelSize - candidatePixelSize) <
+        GRID_VALUE_EPSILON,
+    );
+    if (!candidate) return;
+
+    suggestionFocusRequestRef.current = true;
+    updatePixelSize(candidate.pixelSize, { forceManual: true });
+    setAcceptedSuggestionPixelSize(candidate.pixelSize);
+    setSuggestionDecision("accepted");
+  }
+
+  function rejectGridSuggestion() {
+    if (!gridSuggestion) return;
+    suggestionFocusRequestRef.current = true;
+    updatePixelSize(1);
+    setAcceptedSuggestionPixelSize(null);
+    setSuggestionDecision("rejected");
+  }
+
+  function restoreGridSuggestion() {
+    if (!gridSuggestion) return;
+    suggestionFocusRequestRef.current = true;
+    setAcceptedSuggestionPixelSize(null);
+    setSuggestionDecision("available");
   }
 
   async function handlePixelize() {
@@ -677,6 +822,11 @@ function App() {
     setGridOffset({ x: 0, y: 0 });
     setConfidence(null);
     setDetectedGrid(null);
+    setGridSuggestion(null);
+    setSuggestionDecision(null);
+    setAcceptedSuggestionPixelSize(null);
+    suggestionFocusRequestRef.current = false;
+    setStrictDetectionFailed(false);
     setIsAnalyzing(false);
     setIsProcessing(false);
     setIsDragging(false);
@@ -693,6 +843,18 @@ function App() {
     Math.abs(pixelSize - detectedGrid.pixelSize) < GRID_VALUE_EPSILON &&
     Math.abs(gridOffset.x - detectedGrid.offsetX) < GRID_VALUE_EPSILON &&
     Math.abs(gridOffset.y - detectedGrid.offsetY) < GRID_VALUE_EPSILON;
+  const isSafeFallbackSetting =
+    strictDetectionFailed &&
+    confidence === null &&
+    Math.abs(pixelSize - 1) < GRID_VALUE_EPSILON &&
+    Math.abs(gridOffset.x) < GRID_VALUE_EPSILON &&
+    Math.abs(gridOffset.y) < GRID_VALUE_EPSILON;
+  const detectionStatus =
+    confidence !== null
+      ? `${confidence}% CONFIDENCE`
+      : isSafeFallbackSetting
+        ? "NO SINGLE GRID FOUND"
+        : "MANUAL ADJUSTMENT";
 
   return (
     <div className="app-shell">
@@ -939,25 +1101,26 @@ function App() {
         </section>
 
         {source && outputSize && (
-          <section className="detection-bar" aria-label="Grid detection settings">
+          <section className="detection-bar" aria-label="Grid analysis settings">
             <div className="detection-heading">
               <span className="scan-icon">
                 <ScanSearch size={17} />
               </span>
               <div>
-                <span>DETECTED GRID</span>
-                <strong>
-                  {confidence === null
-                    ? "MANUAL ADJUSTMENT"
-                    : `${confidence}% CONFIDENCE`}
+                <span>GRID ANALYSIS</span>
+                <strong
+                  aria-live="polite"
+                  className={isSafeFallbackSetting ? "no-grid-status" : undefined}
+                >
+                  {detectionStatus}
                 </strong>
               </div>
               {detectedGrid && !isUsingDetectedGrid && (
                 <button
-                  aria-label="Restore detected grid settings"
+                  aria-label="Restore original grid analysis settings"
                   className="restore-detection-button"
                   disabled={isAnalyzing || isProcessing}
-                  title={`Restore ${formatPixelSize(detectedGrid.pixelSize)} px and detected offsets`}
+                  title={`Restore analyzed ${formatPixelSize(detectedGrid.pixelSize)} px grid and offsets`}
                   type="button"
                   onClick={() => updatePixelSize(detectedGrid.pixelSize)}
                 >
@@ -1007,9 +1170,110 @@ function App() {
               </strong>
             </div>
 
-            <p className="detection-note">
-              Not quite right? Adjust the source pixel size.
-            </p>
+            {strictDetectionFailed &&
+            gridSuggestion &&
+            suggestionOutputSize ? (
+              <div
+                aria-label="Advisory texture estimate"
+                className="grid-suggestion"
+                role="group"
+              >
+                <span className="grid-suggestion-kicker">
+                  TEXTURE ESTIMATE · ADVISORY
+                </span>
+                <div className="grid-suggestion-controls">
+                  {suggestionDecision === "accepted" ? (
+                    <>
+                      <span className="grid-suggestion-status" role="status">
+                        {formatPixelSize(
+                          acceptedSuggestionPixelSize ?? pixelSize,
+                        )}{" "}
+                        PX · MANUAL
+                        <small>
+                          {outputSize.width} × {outputSize.height} OUTPUT
+                        </small>
+                      </span>
+                      <button
+                        ref={suggestionFollowupActionRef}
+                        className="grid-suggestion-secondary"
+                        disabled={isAnalyzing || isProcessing}
+                        type="button"
+                        onClick={rejectGridSuggestion}
+                      >
+                        BACK TO 1 PX
+                      </button>
+                    </>
+                  ) : suggestionDecision === "rejected" ? (
+                    <>
+                      <span className="grid-suggestion-status" role="status">
+                        STAYING AT 1 PX
+                        <small>SUGGESTION DISMISSED</small>
+                      </span>
+                      <button
+                        ref={suggestionFollowupActionRef}
+                        className="grid-suggestion-secondary"
+                        disabled={isAnalyzing || isProcessing}
+                        type="button"
+                        onClick={restoreGridSuggestion}
+                      >
+                        RESTORE OPTION
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        ref={suggestionPrimaryActionRef}
+                        aria-label={`Try primary ${formatPixelSize(suggestionOutputSize.pixelSize)} pixel source size; output ${suggestionOutputSize.width} by ${suggestionOutputSize.height} pixels`}
+                        className="grid-suggestion-accept"
+                        disabled={isAnalyzing || isProcessing}
+                        type="button"
+                        onClick={() =>
+                          acceptGridSuggestion(suggestionOutputSize.pixelSize)
+                        }
+                      >
+                        TRY {formatPixelSize(suggestionOutputSize.pixelSize)} PX
+                        <small>
+                          {suggestionOutputSize.width} ×{" "}
+                          {suggestionOutputSize.height} OUTPUT
+                        </small>
+                      </button>
+                      {suggestionCandidates.slice(1).map((candidate) => (
+                        <button
+                          key={candidate.pixelSize}
+                          aria-label={`Try alternative ${formatPixelSize(candidate.pixelSize)} pixel source size; output ${candidate.width} by ${candidate.height} pixels`}
+                          className="grid-suggestion-alternative"
+                          disabled={isAnalyzing || isProcessing}
+                          type="button"
+                          onClick={() =>
+                            acceptGridSuggestion(candidate.pixelSize)
+                          }
+                        >
+                          TRY {formatPixelSize(candidate.pixelSize)} PX
+                          <small>
+                            ALT · {candidate.width} × {candidate.height}
+                          </small>
+                        </button>
+                      ))}
+                      <button
+                        aria-label="Reject suggestion and keep the safe 1 pixel setting"
+                        className="grid-suggestion-secondary"
+                        disabled={isAnalyzing || isProcessing}
+                        type="button"
+                        onClick={rejectGridSuggestion}
+                      >
+                        KEEP 1 PX
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <p className="detection-note">
+                {strictDetectionFailed
+                  ? "No reliable single grid. Staying at a safe 1:1 source size."
+                  : "Not quite right? Adjust the source pixel size."}
+              </p>
+            )}
           </section>
         )}
 

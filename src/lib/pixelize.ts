@@ -1,14 +1,27 @@
 import {
+  analyzePixelGridData,
   buildCellRanges,
   detectPixelGridData,
   getPixelGridDimensions,
+  suggestPixelGridData,
   type PixelGridDetection,
   type PixelGridSettings,
+  type PixelGridSuggestion,
 } from "./gridDetection";
 import { pixelizeBuffer } from "./pixelizeCore";
 
-export type { PixelGridDetection, PixelGridSettings } from "./gridDetection";
-export { buildCellRanges, detectPixelGridData, getPixelGridDimensions };
+export type {
+  PixelGridDetection,
+  PixelGridSettings,
+  PixelGridSuggestion,
+} from "./gridDetection";
+export {
+  analyzePixelGridData,
+  buildCellRanges,
+  detectPixelGridData,
+  getPixelGridDimensions,
+  suggestPixelGridData,
+};
 
 export type SourceGridMapping = {
   xRanges: Array<[number, number]>;
@@ -40,12 +53,7 @@ function createCanvas(width: number, height: number) {
   return canvas;
 }
 
-/**
- * Rasterize a browser image into a bounded analysis buffer, then delegate to
- * the deterministic detector. A 2048px ceiling retains 3px grids that the old
- * 1024px pass collapsed into their 2x harmonic.
- */
-export function detectPixelGrid(image: CanvasImageSource): PixelGridDetection {
+function rasterizeGridAnalysis(image: CanvasImageSource) {
   const isImageElement =
     typeof HTMLImageElement !== "undefined" && image instanceof HTMLImageElement;
   const sourceWidth = isImageElement
@@ -68,12 +76,43 @@ export function detectPixelGrid(image: CanvasImageSource): PixelGridDetection {
   }
 
   context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
   context.drawImage(image, 0, 0, width, height);
 
-  return detectPixelGridData(
-    context.getImageData(0, 0, width, height),
+  return {
+    image: context.getImageData(0, 0, width, height),
     sourceWidth,
     sourceHeight,
+  };
+}
+
+/**
+ * Rasterize a browser image into a bounded analysis buffer, then delegate to
+ * the deterministic detector. A 2048px ceiling retains 3px grids that the old
+ * 1024px pass collapsed into their 2x harmonic.
+ */
+export function detectPixelGrid(image: CanvasImageSource): PixelGridDetection {
+  const analysis = rasterizeGridAnalysis(image);
+  return detectPixelGridData(
+    analysis.image,
+    analysis.sourceWidth,
+    analysis.sourceHeight,
+  );
+}
+
+/**
+ * Main-thread compatibility path for webviews without the image worker.
+ * Suggestions are advisory and are produced only after strict detection fails.
+ */
+export function analyzePixelGrid(image: CanvasImageSource): {
+  detection: PixelGridDetection;
+  suggestion: PixelGridSuggestion | null;
+} {
+  const analysis = rasterizeGridAnalysis(image);
+  return analyzePixelGridData(
+    analysis.image,
+    analysis.sourceWidth,
+    analysis.sourceHeight,
   );
 }
 

@@ -859,6 +859,10 @@ button:disabled {
   letter-spacing: 0.08em;
 }
 
+.detection-heading strong.no-grid-status {
+  color: #d4b568;
+}
+
 .metric {
   padding-left: 17px;
   border-left: 1px solid #282c35;
@@ -915,6 +919,117 @@ button:disabled {
   color: #505561;
   font-size: 10px;
   line-height: 1.45;
+}
+
+.grid-suggestion {
+  display: flex;
+  min-width: 0;
+  align-items: stretch;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.grid-suggestion-kicker {
+  color: #a98f50;
+  font-size: 6px;
+  font-weight: 800;
+  letter-spacing: 0.11em;
+}
+
+.grid-suggestion-controls {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.grid-suggestion button {
+  min-height: 34px;
+  border-radius: 0;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 7px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.grid-suggestion-accept {
+  display: flex;
+  min-width: 96px;
+  align-items: flex-start;
+  flex-direction: column;
+  justify-content: center;
+  border: 1px solid #697744;
+  padding: 6px 9px;
+  color: var(--accent);
+  background: #1b2118;
+  gap: 3px;
+}
+
+.grid-suggestion-accept:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: #222a1c;
+}
+
+.grid-suggestion-accept small,
+.grid-suggestion-alternative small,
+.grid-suggestion-status small {
+  color: #737966;
+  font-size: 6px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
+.grid-suggestion button.grid-suggestion-alternative {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  border: 1px solid #4c5159;
+  padding: 0 7px;
+  color: #aeb2b9;
+  background: #171a21;
+  gap: 5px;
+}
+
+.grid-suggestion-alternative:hover:not(:disabled) {
+  border-color: #777d88;
+  color: var(--ink);
+}
+
+.grid-suggestion-alternative small {
+  color: #676c77;
+}
+
+.grid-suggestion-secondary {
+  flex: none;
+  border: 1px solid #3a3f49;
+  padding: 0 8px;
+  color: #858a95;
+  background: #191c24;
+}
+
+.grid-suggestion-secondary:hover:not(:disabled) {
+  border-color: #626875;
+  color: var(--ink);
+}
+
+.grid-suggestion button:disabled {
+  opacity: 0.42;
+}
+
+.grid-suggestion-status {
+  display: flex;
+  min-width: 96px;
+  flex-direction: column;
+  color: #bdc5a3;
+  font-size: 7px;
+  font-weight: 800;
+  gap: 4px;
+  letter-spacing: 0.08em;
 }
 
 .error-message {
@@ -1581,6 +1696,12 @@ button:disabled {
   .metric-arrow,
   .detection-note {
     display: none;
+  }
+
+  .grid-suggestion {
+    grid-column: 1 / -1;
+    border-top: 1px solid #282c35;
+    padding-top: 10px;
   }
 }
 

@@ -1,6 +1,6 @@
 import {
+  analyzePixelGridData,
   buildCellRanges,
-  detectPixelGridData,
   type PixelBuffer,
 } from "../lib/gridDetection";
 import {
@@ -102,15 +102,17 @@ async function analyze(request: Extract<ImageWorkerRequest, { operation: "analyz
     validateDimensions(bitmap, request.options);
     const analysisPixels = rasterize(bitmap, MAX_DETECTION_DIMENSION);
     const palettePixels = rasterize(bitmap, MAX_PALETTE_DIMENSION);
+    const gridAnalysis = analyzePixelGridData(
+      analysisPixels,
+      bitmap.width,
+      bitmap.height,
+    );
 
     return {
       sourceWidth: bitmap.width,
       sourceHeight: bitmap.height,
-      detection: detectPixelGridData(
-        analysisPixels,
-        bitmap.width,
-        bitmap.height,
-      ),
+      detection: gridAnalysis.detection,
+      suggestion: gridAnalysis.suggestion,
       palette: extractPaletteFromImageData(
         palettePixels,
         request.options.maximumColors ?? DEFAULT_MAXIMUM_COLORS,

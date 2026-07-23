@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  analyzePixelGridData,
   buildCellRanges,
   detectPixelGridData,
   getPixelGridDimensions,
+  suggestPixelGridData,
   type PixelBuffer,
 } from "../src/lib/gridDetection";
 
@@ -344,6 +346,231 @@ function createAlternatingBoundaryFixture(
   }
 
   return { width, height, data };
+}
+
+/**
+ * A locally warped, lightly textured 4px grid. It retains the short plateaus
+ * and staircase gaps of generated pseudo-pixel art while deliberately losing
+ * the globally repeatable phase required by the strict detector.
+ */
+function createPseudoPixelFixture(
+  width = 512,
+  height = 512,
+  pitch = 4,
+  translationX = 0,
+  translationY = 0,
+): PixelBuffer {
+  const data = new Uint8ClampedArray(width * height * 4);
+  const artWidth = Math.min(Math.round(width * 0.375), width);
+  const artHeight = Math.min(Math.round(height * 0.25), height);
+  const artLeft = Math.min(
+    Math.round((width * 91) / 512) + translationX,
+    Math.max(0, width - artWidth),
+  );
+  const artTop = Math.min(
+    Math.round((height * 73) / 512) + translationY,
+    Math.max(0, height - artHeight),
+  );
+  const pseudoHash = (x: number, y: number) => {
+    let value = (x * 0x1f123bb5) ^ (y * 0x5f356495) ^ 0xabc123;
+    value = Math.imul(value ^ (value >>> 16), 0x45d9f3b);
+    return (value ^ (value >>> 16)) >>> 0;
+  };
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = (y * width + x) * 4;
+      const localX = x - artLeft;
+      const localY = y - artTop;
+
+      if (
+        localX < 0 ||
+        localX >= artWidth ||
+        localY < 0 ||
+        localY >= artHeight
+      ) {
+        data[index] = 220;
+        data[index + 1] = 220;
+        data[index + 2] = 220;
+        data[index + 3] = 255;
+        continue;
+      }
+
+      const shiftX =
+        (pseudoHash(Math.floor(localX / 32), Math.floor(localY / 12)) % 3) -
+        1;
+      const shiftY =
+        (pseudoHash(Math.floor(localX / 12), Math.floor(localY / 32)) % 3) -
+        1;
+      const cellX = Math.floor((localX + shiftX) / pitch);
+      const cellY = Math.floor((localY + shiftY) / pitch);
+      const hash = pseudoHash(cellX, cellY);
+      const texture = (pseudoHash(localX, localY) % 3) - 1;
+
+      data[index] = 32 + (hash & 0x9f) + texture;
+      data[index + 1] = 32 + ((hash >>> 8) & 0x9f) + texture;
+      data[index + 2] = 32 + ((hash >>> 16) & 0x9f) + texture;
+      data[index + 3] = 255;
+    }
+  }
+
+  return { width, height, data };
+}
+
+function changeCanvasSize(image: PixelBuffer, edgeChange: number): PixelBuffer {
+  const width = image.width + edgeChange;
+  const height = image.height + edgeChange;
+  const data = new Uint8ClampedArray(width * height * 4);
+
+  for (let index = 0; index < data.length; index += 4) {
+    data[index] = 220;
+    data[index + 1] = 220;
+    data[index + 2] = 220;
+    data[index + 3] = 255;
+  }
+
+  const copiedWidth = Math.min(width, image.width);
+  const copiedHeight = Math.min(height, image.height);
+  for (let row = 0; row < copiedHeight; row += 1) {
+    const sourceStart = row * image.width * 4;
+    data.set(
+      image.data.subarray(sourceStart, sourceStart + copiedWidth * 4),
+      row * width * 4,
+    );
+  }
+
+  return { width, height, data };
+}
+
+function createPhotoLikeFixture(width: number, height: number): PixelBuffer {
+  const data = new Uint8ClampedArray(width * height * 4);
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = (y * width + x) * 4;
+      const grain = (hashCell(x, y, 0x735a2d) % 31) - 15;
+      const wave =
+        Math.sin(x * 0.071 + y * 0.023) * 28 +
+        Math.cos(y * 0.057 - x * 0.019) * 22;
+
+      data[index] = Math.max(0, Math.min(255, 118 + wave + grain));
+      data[index + 1] = Math.max(
+        0,
+        Math.min(255, 102 + wave * 0.7 - grain),
+      );
+      data[index + 2] = Math.max(
+        0,
+        Math.min(255, 136 - wave * 0.45 + grain * 0.6),
+      );
+      data[index + 3] = 255;
+    }
+  }
+
+  return { width, height, data };
+}
+
+function seededRandom(seed: number) {
+  let state = seed >>> 0;
+  return () =>
+    ((state =
+      (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0) /
+      0x1_0000_0000);
+}
+
+function createDrawingCanvas(width = 512, height = 512): PixelBuffer {
+  const data = new Uint8ClampedArray(width * height * 4);
+  for (let index = 0; index < data.length; index += 4) {
+    data[index] = 250;
+    data[index + 1] = 250;
+    data[index + 2] = 250;
+    data[index + 3] = 255;
+  }
+  return { width, height, data };
+}
+
+function drawRectangle(
+  image: PixelBuffer,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+) {
+  const left = Math.max(0, Math.floor(x0));
+  const top = Math.max(0, Math.floor(y0));
+  const right = Math.min(image.width - 1, Math.floor(x1));
+  const bottom = Math.min(image.height - 1, Math.floor(y1));
+
+  for (let y = top; y <= bottom; y += 1) {
+    for (let x = left; x <= right; x += 1) {
+      const index = (y * image.width + x) * 4;
+      image.data[index] = 20;
+      image.data[index + 1] = 20;
+      image.data[index + 2] = 20;
+    }
+  }
+}
+
+function createRandomLineArt(seed = 47) {
+  const image = createDrawingCanvas();
+  const random = seededRandom(seed);
+
+  for (let index = 0; index < 70; index += 1) {
+    const x = 5 + Math.floor(random() * 475);
+    const y = 5 + Math.floor(random() * 475);
+    const length = 20 + Math.floor(random() * 100);
+    if (index % 2 === 1) {
+      drawRectangle(image, x, y, x + length, y + 3);
+    } else {
+      drawRectangle(image, x, y, x + 3, y + length);
+    }
+  }
+
+  return image;
+}
+
+function createIrregularBars(seed = 47) {
+  const image = createDrawingCanvas();
+  const random = seededRandom(seed);
+  const sizes = [2, 4, 6];
+
+  for (let y = 0; y < image.height; y += 13) {
+    for (let x = 0; x < image.width; x += 11) {
+      if (random() >= 0.45) continue;
+      const width = sizes[Math.floor(random() * sizes.length)];
+      const height = sizes[Math.floor(random() * sizes.length)];
+      drawRectangle(image, x, y, x + width, y + height);
+    }
+  }
+
+  return image;
+}
+
+function createDenseMonospaceText() {
+  const image = createDrawingCanvas();
+  const random = seededRandom(47);
+
+  // Deterministic 5x7 bitmap glyphs reproduce the dense, axis-aligned stroke
+  // topology of a 14–16px monospace text page without relying on host fonts.
+  for (let top = 4; top + 14 < image.height; top += 19) {
+    for (let left = 4; left + 10 < image.width; left += 10) {
+      const glyph = Math.floor(random() * 0x7fffffff);
+      for (let row = 0; row < 7; row += 1) {
+        for (let column = 0; column < 5; column += 1) {
+          const bit = (glyph >>> ((row * 5 + column) % 30)) & 1;
+          if (bit === 0) continue;
+          drawRectangle(
+            image,
+            left + column * 2,
+            top + row * 2,
+            left + column * 2 + 1,
+            top + row * 2 + 1,
+          );
+        }
+      }
+    }
+  }
+
+  return image;
 }
 
 function expectPitch(
@@ -707,5 +934,123 @@ describe("pixel-grid detector regressions", () => {
         offsetY: detection.offsetY,
       }),
     ).toEqual({ width: 80, height: 80 });
+  });
+
+  it("keeps the secondary suggestion advisory when strict detection succeeds", () => {
+    const image = createGridFixture({ width: 512, height: 512, pitch: 8 });
+
+    expect(suggestPixelGridData(image)).toBeNull();
+    expect(analyzePixelGridData(image)).toEqual({
+      detection: detectPixelGridData(image),
+      suggestion: null,
+    });
+  });
+
+  it.each([3, 4, 5, 6, 7, 8])(
+    "suggests a low-confidence %ipx edit for locally warped pseudo-pixels",
+    (pitch) => {
+      const image = createPseudoPixelFixture(512, 512, pitch);
+
+      expect(detectPixelGridData(image)).toEqual({
+        pixelSize: 1,
+        confidence: 0,
+        offsetX: 0,
+        offsetY: 0,
+      });
+      const suggestion = suggestPixelGridData(image);
+      expect(suggestion?.pixelSize).toBe(pitch);
+      expect(suggestion?.confidence).toBeGreaterThan(0);
+      expect(suggestion?.confidence).toBeLessThanOrEqual(35);
+    },
+  );
+
+  it("combines strict failure and advisory analysis without changing either result", () => {
+    const image = createPseudoPixelFixture();
+
+    expect(analyzePixelGridData(image)).toEqual({
+      detection: {
+        pixelSize: 1,
+        confidence: 0,
+        offsetX: 0,
+        offsetY: 0,
+      },
+      suggestion: suggestPixelGridData(image),
+    });
+  });
+
+  it.each([-3, -1, 0, 1, 3])(
+    "keeps the 4px suggestion after a %ipx source-edge change",
+    (edgeChange) => {
+      const image = createPseudoPixelFixture();
+      const suggestion = suggestPixelGridData(
+        image,
+        image.width + edgeChange,
+        image.height + edgeChange,
+      );
+
+      expect(suggestion?.pixelSize).toBe(4);
+    },
+  );
+
+  it("phase-balances high-resolution translation, crop, and padding samples", () => {
+    const base = createPseudoPixelFixture(1600, 1600, 4);
+    const variants = [
+      createPseudoPixelFixture(1600, 1600, 4, 3, 3),
+      changeCanvasSize(base, -3),
+      changeCanvasSize(base, 3),
+    ];
+
+    for (const image of variants) {
+      expect(suggestPixelGridData(image)?.pixelSize).toBe(4);
+    }
+  });
+
+  it.each([
+    {
+      label: "diagonal gradient",
+      image: createGradientFixture(512, 512, "diagonal"),
+    },
+    {
+      label: "radial gradient",
+      image: createGradientFixture(512, 512, "radial"),
+    },
+    {
+      label: "smooth periodic tone",
+      image: createSmoothPeriodicFixture(512, 512),
+    },
+    {
+      label: "codec seams",
+      image: createCodecBlockingFixture(512, 512),
+    },
+    {
+      label: "one-axis stripes",
+      image: createStripeFixture(512, 512, 4),
+    },
+    {
+      label: "photo-like texture",
+      image: createPhotoLikeFixture(512, 512),
+    },
+  ])("returns no advisory suggestion for $label", ({ image }) => {
+    expect(suggestPixelGridData(image)).toBeNull();
+  });
+
+  it("withholds advisory guesses for compressed photo thumbnails", () => {
+    expect(
+      suggestPixelGridData(createPhotoLikeFixture(356, 356)),
+    ).toBeNull();
+  });
+
+  it.each([
+    { label: "dense monospace text", image: createDenseMonospaceText() },
+    { label: "irregular 2D bars", image: createIrregularBars() },
+    { label: "axis-aligned floorplan lines", image: createRandomLineArt() },
+  ])("rejects structured non-pixel-art: $label", ({ image }) => {
+    expect(detectPixelGridData(image)).toEqual({
+      pixelSize: 1,
+      confidence: 0,
+      offsetX: 0,
+      offsetY: 0,
+    });
+    expect(suggestPixelGridData(image)).toBeNull();
   });
 });
