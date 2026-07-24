@@ -22,6 +22,7 @@ import {
   ZoomOut,
 } from "lucide-react";
 import type { PixelizeResult } from "../lib/pixelize";
+import { encodeIndexedPng } from "../lib/indexedPng";
 
 type EditorTool = "pencil" | "fill" | "eyedropper" | "eraser" | "crop";
 
@@ -362,6 +363,13 @@ function renderOriginalOverlay(
 }
 
 function canvasToPng(canvas: HTMLCanvasElement) {
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (context) {
+    const image = context.getImageData(0, 0, canvas.width, canvas.height);
+    const indexed = encodeIndexedPng(image.data, canvas.width, canvas.height);
+    if (indexed) return Promise.resolve(indexed);
+  }
+
   return new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((blob) => {
       if (blob) {

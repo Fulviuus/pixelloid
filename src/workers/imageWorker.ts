@@ -13,6 +13,11 @@ import {
 import { extractPaletteFromImageData } from "../lib/palette";
 import { pixelizeBuffer } from "../lib/pixelizeCore";
 import { removeEdgeConnectedBackground } from "../lib/backgroundRemoval";
+import { encodeIndexedPng } from "../lib/indexedPng";
+import {
+  detectScaleWithUnfake,
+  quantizePixelizedBufferWithUnfake,
+} from "../lib/unfakePipeline";
 
 const MAX_DETECTION_DIMENSION = 2048;
 const MAX_PALETTE_DIMENSION = 256;
@@ -109,7 +114,31 @@ async function analyze(request: Extract<ImageWorkerRequest, { operation: "analyz
       bitmap.width,
       bitmap.height,
     );
-    const phaseAlignments = (request.options.phasePixelSizes ?? [])
+    const unfakeAnalysisScale = await detectScaleWithUnfake(analysisPixels);
+    const unfakeSourceScale =
+      unfakeAnalysisScale > 1
+        ? unfakeAnalysisScale *
+          ((bitmap.width / analysisPixels.width +
+            bitmap.height / analysisPixels.height) /
+            2)
+        : 1;
+    const useUnfakeFallback =
+      gridAnalysis.detection.pixelSize === 1 &&
+      gridAnalysis.detection.confidence === 0 &&
+      unfakeSourceScale > 1;
+    const suggestion =
+      useUnfakeFallback && !gridAnalysis.suggestion
+        ? {
+            pixelSize: unfakeSourceScale,
+            confidence: 35,
+            alternatives: [],
+          }
+        : gridAnalysis.suggestion;
+    const phasePixelSizes = [
+      ...(request.options.phasePixelSizes ?? []),
+      ...(useUnfakeFallback ? [unfakeSourceScale] : []),
+    ];
+    const phaseAlignments = phasePixelSizes
       .slice(0, 3)
       .map((pixelSize) =>
         alignPixelGridPhaseData(
@@ -125,7 +154,7 @@ async function analyze(request: Extract<ImageWorkerRequest, { operation: "analyz
       sourceWidth: bitmap.width,
       sourceHeight: bitmap.height,
       detection: gridAnalysis.detection,
-      suggestion: gridAnalysis.suggestion,
+      suggestion,
       phaseAlignments,
       palette: extractPaletteFromImageData(
         palettePixels,
@@ -165,7 +194,7 @@ async function pixelize(
       Math.abs(request.settings.offsetX) < 1e-6 &&
       Math.abs(request.settings.offsetY) < 1e-6;
 
-    if (isIdentity) {
+    if (isIdentity && request.settings.samplingMode !== "smart") {
       const xRanges = buildCellRanges(sourceWidth, 1, 0);
       const yRanges = buildCellRanges(sourceHeight, 1, 0);
       const blob = await sourceCanvas.convertToBlob({ type: "image/png" });
@@ -189,15 +218,34 @@ async function pixelize(
     // source canvas before allocating the output backing store.
     sourceCanvas.width = 1;
     sourceCanvas.height = 1;
-    const result = pixelizeBuffer(sourcePixels, request.settings);
-    const outputCanvas = new OffscreenCanvas(result.width, result.height);
-    const outputContext = getContext(outputCanvas);
-    outputContext.putImageData(
-      new ImageData(result.data, result.width, result.height),
-      0,
-      0,
+    let result = pixelizeBuffer(sourcePixels, request.settings);
+    if (
+      request.settings.samplingMode === "smart" &&
+      request.settings.maximumColors !== undefined
+    ) {
+      result = await quantizePixelizedBufferWithUnfake(
+        result,
+        request.settings.maximumColors,
+      );
+    }
+    const indexedBlob = encodeIndexedPng(
+      result.data,
+      result.width,
+      result.height,
     );
-    const blob = await outputCanvas.convertToBlob({ type: "image/png" });
+    let blob: Blob;
+    if (indexedBlob) {
+      blob = indexedBlob;
+    } else {
+      const outputCanvas = new OffscreenCanvas(result.width, result.height);
+      const outputContext = getContext(outputCanvas);
+      outputContext.putImageData(
+        new ImageData(result.data, result.width, result.height),
+        0,
+        0,
+      );
+      blob = await outputCanvas.convertToBlob({ type: "image/png" });
+    }
 
     return {
       blob,

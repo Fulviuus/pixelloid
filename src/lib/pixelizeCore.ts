@@ -19,6 +19,7 @@ const MAX_SAMPLE_COUNT = 7 * 7;
 const IDENTITY_EPSILON = 1e-6;
 const SWS_FIXED_POINT_SCALE = 1 << 16;
 const FOREGROUND_ALPHA_THRESHOLD = 16;
+const ADAPTIVE_SCORE_CAP = 120;
 
 type ForegroundFit = {
   sourceLeft: number;
@@ -428,6 +429,196 @@ function sampleMedoidCellInto(
   output[outputOffset + 1] = samples[bestOffset + 1];
   output[outputOffset + 2] = samples[bestOffset + 2];
   output[outputOffset + 3] = samples[bestOffset + 3];
+  return sampleCount;
+}
+
+function sampleDominantInto(
+  samples: Uint8Array,
+  sampleCount: number,
+  output: Uint8ClampedArray,
+  outputOffset: number,
+) {
+  const counts = new Map<number, number>();
+  let dominantKey = 0;
+  let dominantCount = 0;
+
+  for (let sample = 0; sample < sampleCount; sample += 1) {
+    const offset = sample * 4;
+    const alphaBand = samples[offset + 3] >= 128 ? 1 : 0;
+    const key =
+      (alphaBand << 15) |
+      ((samples[offset] >> 3) << 10) |
+      ((samples[offset + 1] >> 3) << 5) |
+      (samples[offset + 2] >> 3);
+    const count = (counts.get(key) ?? 0) + 1;
+    counts.set(key, count);
+
+    if (count > dominantCount) {
+      dominantCount = count;
+      dominantKey = key;
+    }
+  }
+
+  let bestSample = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (let candidate = 0; candidate < sampleCount; candidate += 1) {
+    const candidateOffset = candidate * 4;
+    const alphaBand = samples[candidateOffset + 3] >= 128 ? 1 : 0;
+    const key =
+      (alphaBand << 15) |
+      ((samples[candidateOffset] >> 3) << 10) |
+      ((samples[candidateOffset + 1] >> 3) << 5) |
+      (samples[candidateOffset + 2] >> 3);
+    if (key !== dominantKey) continue;
+
+    let totalDistance = 0;
+    for (let other = 0; other < sampleCount; other += 1) {
+      const otherOffset = other * 4;
+      const otherAlphaBand = samples[otherOffset + 3] >= 128 ? 1 : 0;
+      const otherKey =
+        (otherAlphaBand << 15) |
+        ((samples[otherOffset] >> 3) << 10) |
+        ((samples[otherOffset + 1] >> 3) << 5) |
+        (samples[otherOffset + 2] >> 3);
+      if (otherKey !== dominantKey) continue;
+
+      totalDistance +=
+        Math.abs(samples[candidateOffset] - samples[otherOffset]) +
+        Math.abs(samples[candidateOffset + 1] - samples[otherOffset + 1]) +
+        Math.abs(samples[candidateOffset + 2] - samples[otherOffset + 2]) +
+        Math.abs(samples[candidateOffset + 3] - samples[otherOffset + 3]);
+    }
+
+    if (totalDistance < bestDistance) {
+      bestDistance = totalDistance;
+      bestSample = candidate;
+    }
+  }
+
+  const bestOffset = bestSample * 4;
+  output[outputOffset] = samples[bestOffset];
+  output[outputOffset + 1] = samples[bestOffset + 1];
+  output[outputOffset + 2] = samples[bestOffset + 2];
+  output[outputOffset + 3] = samples[bestOffset + 3];
+}
+
+function adaptiveCandidateScore(
+  samples: Uint8Array,
+  sampleCount: number,
+  candidates: Uint8ClampedArray,
+  candidateOffset: number,
+) {
+  const candidateAlpha = candidates[candidateOffset + 3] / 255;
+  let score = 0;
+
+  for (let sample = 0; sample < sampleCount; sample += 1) {
+    const sampleOffset = sample * 4;
+    const sampleAlpha = samples[sampleOffset + 3] / 255;
+    const red = Math.abs(
+      candidates[candidateOffset] * candidateAlpha -
+        samples[sampleOffset] * sampleAlpha,
+    );
+    const green = Math.abs(
+      candidates[candidateOffset + 1] * candidateAlpha -
+        samples[sampleOffset + 1] * sampleAlpha,
+    );
+    const blue = Math.abs(
+      candidates[candidateOffset + 2] * candidateAlpha -
+        samples[sampleOffset + 2] * sampleAlpha,
+    );
+    const alpha = Math.abs(
+      candidates[candidateOffset + 3] - samples[sampleOffset + 3],
+    );
+    const error =
+      red * 0.3 + green * 0.48 + blue * 0.22 + alpha * 0.7;
+    score += Math.min(ADAPTIVE_SCORE_CAP, error);
+  }
+
+  return score / Math.max(1, sampleCount);
+}
+
+function sampleAdaptiveCellInto(
+  source: PixelBuffer,
+  left: number,
+  top: number,
+  right: number,
+  bottom: number,
+  output: Uint8ClampedArray,
+  outputOffset: number,
+  samples: Uint8Array,
+  candidates: Uint8ClampedArray,
+  sourceHasTransparency: boolean,
+) {
+  sampleNearestCellInto(
+    source,
+    left,
+    top,
+    right,
+    bottom,
+    candidates,
+    0,
+  );
+  const sampleCount = sampleMedoidCellInto(
+    source,
+    left,
+    top,
+    right,
+    bottom,
+    candidates,
+    4,
+    samples,
+  );
+  sampleDominantInto(samples, sampleCount, candidates, 8);
+
+  // Medoid is the conservative baseline. Nearest or dominant must provide a
+  // meaningful reconstruction-error improvement to replace it.
+  let bestOffset = 4;
+  let bestScore = adaptiveCandidateScore(samples, sampleCount, candidates, 4);
+  const nearestScore = adaptiveCandidateScore(
+    samples,
+    sampleCount,
+    candidates,
+    0,
+  );
+  if (nearestScore + 1 < bestScore * 0.94) {
+    bestOffset = 0;
+    bestScore = nearestScore;
+  }
+  const dominantScore = adaptiveCandidateScore(
+    samples,
+    sampleCount,
+    candidates,
+    8,
+  );
+  if (dominantScore + 1 < bestScore * 0.96) {
+    bestOffset = 8;
+  }
+
+  output[outputOffset] = candidates[bestOffset];
+  output[outputOffset + 1] = candidates[bestOffset + 1];
+  output[outputOffset + 2] = candidates[bestOffset + 2];
+  output[outputOffset + 3] = candidates[bestOffset + 3];
+
+  // Do not alter alpha for opaque sources. Removed/transparent backgrounds,
+  // however, need a true binary alpha channel in the final pixel grid.
+  if (sourceHasTransparency) {
+    if (output[outputOffset + 3] >= 128) {
+      output[outputOffset + 3] = 255;
+    } else {
+      output[outputOffset] = 0;
+      output[outputOffset + 1] = 0;
+      output[outputOffset + 2] = 0;
+      output[outputOffset + 3] = 0;
+    }
+  }
+}
+
+function hasTransparency(source: PixelBuffer) {
+  for (let offset = 3; offset < source.data.length; offset += 4) {
+    if (source.data[offset] < 255) return true;
+  }
+  return false;
 }
 
 function assertUsableSource(source: PixelBuffer) {
@@ -454,9 +645,11 @@ function assertUsableSource(source: PixelBuffer) {
  * phase-aligned source cell or, when requested, performs the conventional
  * whole-canvas nearest-neighbor coordinate transform.
  * Medoid sampling reuses one 49-pixel scratch buffer and always emits a complete
- * RGBA value observed in the source. In the exact 1:1 case `data` aliases the
- * source buffer; callers must copy it first if they need an independently
- * mutable result.
+ * RGBA value observed in the source. Smart evaluates nearest, medoid, and
+ * dominant source colors against each source cell, preferring medoid unless
+ * another candidate materially reduces reconstruction error. In the exact 1:1
+ * case `data` aliases the source buffer; callers must copy it first if they need
+ * an independently mutable result.
  */
 export function pixelizeBuffer(
   source: PixelBuffer,
@@ -464,18 +657,24 @@ export function pixelizeBuffer(
 ): PixelizedBuffer {
   assertUsableSource(source);
 
+  const samplingMode =
+    settings.samplingMode === "medoid"
+      ? "medoid"
+      : settings.samplingMode === "smart"
+        ? "smart"
+        : "nearest";
+  const effectiveOffsetX = settings.offsetX;
+  const effectiveOffsetY = settings.offsetY;
   const phaseXRanges = buildCellRanges(
     source.width,
     settings.pixelSize,
-    settings.offsetX,
+    effectiveOffsetX,
   ) as CellRange[];
   const phaseYRanges = buildCellRanges(
     source.height,
     settings.pixelSize,
-    settings.offsetY,
+    effectiveOffsetY,
   ) as CellRange[];
-  const samplingMode =
-    settings.samplingMode === "medoid" ? "medoid" : "nearest";
   const fitToCanvas =
     samplingMode === "nearest" && settings.fitToCanvas === true;
   const xRanges = fitToCanvas
@@ -486,8 +685,8 @@ export function pixelizeBuffer(
     : phaseYRanges;
   const isIdentity =
     Math.abs(settings.pixelSize - 1) < IDENTITY_EPSILON &&
-    Math.abs(settings.offsetX) < IDENTITY_EPSILON &&
-    Math.abs(settings.offsetY) < IDENTITY_EPSILON;
+    Math.abs(effectiveOffsetX) < IDENTITY_EPSILON &&
+    Math.abs(effectiveOffsetY) < IDENTITY_EPSILON;
 
   if (isIdentity) {
     const requiredLength = source.width * source.height * 4;
@@ -512,9 +711,13 @@ export function pixelizeBuffer(
       ? findForegroundFit(source, settings.pixelSize, width, height)
       : null;
   const samples =
-    samplingMode === "medoid"
+    samplingMode === "medoid" || samplingMode === "smart"
       ? new Uint8Array(MAX_SAMPLE_COUNT * 4)
       : null;
+  const candidates =
+    samplingMode === "smart" ? new Uint8ClampedArray(3 * 4) : null;
+  const sourceHasTransparency =
+    samplingMode === "smart" && hasTransparency(source);
 
   for (let y = 0; y < height; y += 1) {
     const yRange = yRanges[y];
@@ -574,6 +777,19 @@ export function pixelizeBuffer(
           outputOffset,
           samples,
         );
+      } else if (samplingMode === "smart" && samples && candidates) {
+        sampleAdaptiveCellInto(
+          source,
+          xRange[0],
+          yRange[0],
+          xRange[1],
+          yRange[1],
+          data,
+          outputOffset,
+          samples,
+          candidates,
+          sourceHasTransparency,
+        );
       } else {
         sampleNearestCellInto(
           source,
@@ -591,7 +807,6 @@ export function pixelizeBuffer(
   if (foregroundFit) {
     removeIsolatedLightEdgeFringe(data, width, height);
   }
-
   return {
     width,
     height,

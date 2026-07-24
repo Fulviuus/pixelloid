@@ -2,20 +2,25 @@ import { Moon, Settings, Sun, X } from "lucide-react";
 import { useEffect, useRef } from "react";
 
 export type AppTheme = "dark" | "light";
+export type SmartPaletteMode = "off" | "64" | "32";
 
 export type SettingsDialogProps = {
   theme: AppTheme;
   chromaKey: string;
+  smartPalette: SmartPaletteMode;
   onThemeChange: (theme: AppTheme) => void;
   onChromaKeyChange: (color: string) => void;
+  onSmartPaletteChange: (mode: SmartPaletteMode) => void;
   onClose: () => void;
 };
 
 export function SettingsDialog({
   theme,
   chromaKey,
+  smartPalette,
   onThemeChange,
   onChromaKeyChange,
+  onSmartPaletteChange,
   onClose,
 }: SettingsDialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -119,6 +124,32 @@ export function SettingsDialog({
               />
               <output>{chromaKey.toUpperCase()}</output>
             </label>
+          </section>
+
+          <section className="settings-row">
+            <div className="settings-copy">
+              <strong>SMART PALETTE</strong>
+              <span>
+                Optionally reduce colors after sampling. No dithering or
+                pre-processing.
+              </span>
+            </div>
+            <div
+              className="settings-segmented"
+              role="group"
+              aria-label="Smart palette reduction"
+            >
+              {(["off", "64", "32"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  aria-pressed={smartPalette === mode}
+                  onClick={() => onSmartPaletteChange(mode)}
+                >
+                  {mode === "off" ? "OFF" : mode}
+                </button>
+              ))}
+            </div>
           </section>
         </div>
 

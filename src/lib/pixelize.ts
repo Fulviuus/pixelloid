@@ -11,6 +11,8 @@ import {
   type PixelGridSuggestion,
 } from "./gridDetection";
 import { pixelizeBuffer } from "./pixelizeCore";
+import { encodeIndexedPng } from "./indexedPng";
+import { quantizePixelizedBufferWithUnfake } from "./unfakePipeline";
 
 export type {
   PixelGridDetection,
@@ -173,6 +175,7 @@ export async function pixelizeImage(
   sourceContext.drawImage(image, 0, 0);
 
   if (
+    settings.samplingMode !== "smart" &&
     Math.abs(settings.pixelSize - 1) < 1e-6 &&
     Math.abs(settings.offsetX) < 1e-6 &&
     Math.abs(settings.offsetY) < 1e-6
@@ -199,7 +202,16 @@ export async function pixelizeImage(
     sourceWidth,
     sourceHeight,
   );
-  const generated = pixelizeBuffer(sourcePixels, settings);
+  let generated = pixelizeBuffer(sourcePixels, settings);
+  if (
+    settings.samplingMode === "smart" &&
+    settings.maximumColors !== undefined
+  ) {
+    generated = await quantizePixelizedBufferWithUnfake(
+      generated,
+      settings.maximumColors,
+    );
+  }
   const outputCanvas = createCanvas(generated.width, generated.height);
   const outputContext = outputCanvas.getContext("2d");
 
@@ -213,12 +225,14 @@ export async function pixelizeImage(
     0,
   );
 
-  const blob = await new Promise<Blob>((resolve, reject) => {
-    outputCanvas.toBlob((value) => {
-      if (value) resolve(value);
-      else reject(new Error("The PNG could not be created."));
-    }, "image/png");
-  });
+  const blob =
+    encodeIndexedPng(generated.data, generated.width, generated.height) ??
+    (await new Promise<Blob>((resolve, reject) => {
+      outputCanvas.toBlob((value) => {
+        if (value) resolve(value);
+        else reject(new Error("The PNG could not be created."));
+      }, "image/png");
+    }));
 
   return {
     blob,

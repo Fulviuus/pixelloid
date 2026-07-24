@@ -5,7 +5,7 @@ export type PixelGridDetection = {
   offsetY: number;
 };
 
-export type PixelSamplingMode = "nearest" | "medoid";
+export type PixelSamplingMode = "nearest" | "medoid" | "smart";
 
 export type PixelGridSettings = {
   pixelSize: number;
@@ -19,6 +19,8 @@ export type PixelGridSettings = {
    * canvas. This prevents transparent padding from shifting nearest samples.
    */
   fitForeground?: boolean;
+  /** Optional post-downscale imagequant color limit used by Smart sampling. */
+  maximumColors?: number;
 };
 
 export type PixelGridSuggestion = {

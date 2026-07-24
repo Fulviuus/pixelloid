@@ -30,6 +30,7 @@ import { PixelMark } from "./components/PixelMark";
 import {
   SettingsDialog,
   type AppTheme,
+  type SmartPaletteMode,
 } from "./components/SettingsDialog";
 import {
   getImageWorkerClient,
@@ -54,6 +55,7 @@ import {
 } from "./lib/gridAmbiguity";
 import { extractImagePalette } from "./lib/palette";
 import { removeEdgeConnectedBackground } from "./lib/backgroundRemoval";
+import { pixelBlobToSvg } from "./lib/vectorExport";
 import "./App.css";
 
 type SourceImage = {
@@ -100,6 +102,7 @@ const GRID_VALUE_PRECISION = 1000;
 const GRID_VALUE_EPSILON = 1 / GRID_VALUE_PRECISION;
 const THEME_STORAGE_KEY = "pixelloid.theme";
 const CHROMA_KEY_STORAGE_KEY = "pixelloid.chroma-key";
+const SMART_PALETTE_STORAGE_KEY = "pixelloid.smart-palette";
 const DEFAULT_CHROMA_KEY = "#ff00ff";
 
 function storedTheme(): AppTheme {
@@ -120,6 +123,15 @@ function storedChromaKey() {
       : DEFAULT_CHROMA_KEY;
   } catch {
     return DEFAULT_CHROMA_KEY;
+  }
+}
+
+function storedSmartPalette(): SmartPaletteMode {
+  try {
+    const stored = localStorage.getItem(SMART_PALETTE_STORAGE_KEY);
+    return stored === "32" || stored === "64" ? stored : "off";
+  } catch {
+    return "off";
   }
 }
 
@@ -425,16 +437,19 @@ function App() {
     useState<number | null>(null);
   const [strictDetectionFailed, setStrictDetectionFailed] = useState(false);
   const [samplingMode, setSamplingMode] =
-    useState<PixelSamplingMode>("nearest");
+    useState<PixelSamplingMode>("medoid");
   const [isDragging, setIsDragging] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isExportingSvg, setIsExportingSvg] = useState(false);
   const [isRemovingBackground, setIsRemovingBackground] = useState(false);
   const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [sourcePalette, setSourcePalette] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [theme, setTheme] = useState<AppTheme>(storedTheme);
   const [chromaKey, setChromaKey] = useState(storedChromaKey);
+  const [smartPalette, setSmartPalette] =
+    useState<SmartPaletteMode>(storedSmartPalette);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const shortcutHandlerRef = useRef<(event: globalThis.KeyboardEvent) => void>(
     () => undefined,
@@ -456,10 +471,11 @@ function App() {
     try {
       localStorage.setItem(THEME_STORAGE_KEY, theme);
       localStorage.setItem(CHROMA_KEY_STORAGE_KEY, chromaKey);
+      localStorage.setItem(SMART_PALETTE_STORAGE_KEY, smartPalette);
     } catch {
       // The settings still apply for this session when storage is unavailable.
     }
-  }, [chromaKey, theme]);
+  }, [chromaKey, smartPalette, theme]);
 
   const outputSize = useMemo(() => {
     if (!source) return null;
@@ -565,6 +581,10 @@ function App() {
           fitForeground:
             samplingMode === "nearest" &&
             previewSource.backgroundRemoved,
+          maximumColors:
+            samplingMode === "smart" && smartPalette !== "off"
+              ? Number(smartPalette)
+              : undefined,
         };
         let url: string;
 
@@ -632,7 +652,7 @@ function App() {
       }
       createdUrls.forEach((url) => URL.revokeObjectURL(url));
     };
-  }, [gridAmbiguity, samplingMode, source]);
+  }, [gridAmbiguity, samplingMode, smartPalette, source]);
 
   useEffect(() => {
     function preventWindowFileDrop(event: globalThis.DragEvent) {
@@ -1278,6 +1298,10 @@ function App() {
         samplingMode === "nearest" && !sourceAtStart.backgroundRemoved,
       fitForeground:
         samplingMode === "nearest" && sourceAtStart.backgroundRemoved,
+      maximumColors:
+        samplingMode === "smart" && smartPalette !== "off"
+          ? Number(smartPalette)
+          : undefined,
     };
     setError(null);
     setIsProcessing(true);
@@ -1365,6 +1389,40 @@ function App() {
       if (generation === conversionGenerationRef.current) {
         setIsProcessing(false);
       }
+    }
+  }
+
+  async function handleVectorExport() {
+    if (!result || !source || isExportingSvg) return;
+
+    const resultAtStart = result;
+    setError(null);
+    setIsExportingSvg(true);
+
+    try {
+      const svg = await pixelBlobToSvg(
+        resultAtStart.blob,
+        `${source.file.name.replace(/\.[^.]+$/, "")} — Pixelloid`,
+      );
+      if (resultRef.current !== resultAtStart) return;
+
+      const url = URL.createObjectURL(
+        new Blob([svg], { type: "image/svg+xml;charset=utf-8" }),
+      );
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${source.file.name.replace(
+        /\.[^.]+$/,
+        "",
+      )}-pixel-perfect.svg`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch {
+      setError("The SVG could not be created from the current result.");
+    } finally {
+      setIsExportingSvg(false);
     }
   }
 
@@ -1660,14 +1718,25 @@ function App() {
                       {result.width} × {result.height} PX
                     </span>
                   </div>
-                  <a
-                    className="download-button"
-                    download={downloadName}
-                    href={result.url}
-                  >
-                    <Download size={14} strokeWidth={2.4} />
-                    DOWNLOAD PNG
-                  </a>
+                  <div className="download-actions">
+                    <a
+                      className="download-button"
+                      download={downloadName}
+                      href={result.url}
+                    >
+                      <Download size={14} strokeWidth={2.4} />
+                      DOWNLOAD PNG
+                    </a>
+                    <button
+                      className="download-button"
+                      disabled={isExportingSvg}
+                      type="button"
+                      onClick={() => void handleVectorExport()}
+                    >
+                      <Download size={14} strokeWidth={2.4} />
+                      {isExportingSvg ? "BUILDING SVG…" : "DOWNLOAD SVG"}
+                    </button>
+                  </div>
                 </>
               ) : (
                 <span>YOUR RESULT</span>
@@ -1770,6 +1839,15 @@ function App() {
                   onClick={() => updateSamplingMode("medoid")}
                 >
                   MEDOID
+                </button>
+                <button
+                  aria-pressed={samplingMode === "smart"}
+                  disabled={isAnalyzing || isProcessing}
+                  title="Compare nearest, medoid, and dominant source colors per cell and keep the closest reconstruction"
+                  type="button"
+                  onClick={() => updateSamplingMode("smart")}
+                >
+                  SMART
                 </button>
               </div>
             </div>
@@ -1982,8 +2060,10 @@ function App() {
         <SettingsDialog
           theme={theme}
           chromaKey={chromaKey}
+          smartPalette={smartPalette}
           onThemeChange={setTheme}
           onChromaKeyChange={(color) => setChromaKey(color.toLowerCase())}
+          onSmartPaletteChange={setSmartPalette}
           onClose={() => setIsSettingsOpen(false)}
         />
       )}

@@ -235,4 +235,80 @@ describe("pixelizeBuffer", () => {
     // Independent channel medians would invent white (255, 255, 255).
     expect([...result.data]).toEqual([0, 255, 255, 255]);
   });
+
+  it("keeps the selected grid dimensions and phase in smart mode", () => {
+    const source = rgbaBuffer(10, 10, 80);
+
+    const result = pixelizeBuffer(source, {
+      pixelSize: 3,
+      offsetX: 1,
+      offsetY: 2,
+      samplingMode: "smart",
+    });
+
+    expect(result.width).toBe(3);
+    expect(result.height).toBe(3);
+    expect(result.xRanges).toEqual([
+      [1, 4],
+      [4, 7],
+      [7, 10],
+    ]);
+    expect(result.yRanges).toEqual([
+      [2, 5],
+      [5, 8],
+      [8, 10],
+    ]);
+  });
+
+  it("rejects a bright center outlier in smart mode", () => {
+    const source = rgbaBuffer(8, 8);
+
+    for (let y = 1; y < 7; y += 1) {
+      for (let x = 1; x < 7; x += 1) {
+        const offset = (y * source.width + x) * 4;
+        const variation = (x + y) % 3;
+        source.data.set(
+          [120 + variation, 62 + variation, 31 + variation, 255],
+          offset,
+        );
+      }
+    }
+    source.data.set([255, 250, 240, 255], (4 * source.width + 4) * 4);
+
+    const result = pixelizeBuffer(source, {
+      pixelSize: 8,
+      offsetX: 0,
+      offsetY: 0,
+      samplingMode: "smart",
+    });
+
+    expect([...result.data]).toEqual([121, 63, 32, 255]);
+  });
+
+  it("binarizes alpha only when the source contains transparency", () => {
+    const transparent = rgbaBuffer(4, 4, 40);
+    for (let offset = 3; offset < transparent.data.length; offset += 4) {
+      transparent.data[offset] = 100;
+    }
+    const transparentResult = pixelizeBuffer(transparent, {
+      pixelSize: 2,
+      offsetX: 0,
+      offsetY: 0,
+      samplingMode: "smart",
+    });
+
+    expect([...transparentResult.data]).toEqual(
+      new Array(transparentResult.width * transparentResult.height * 4).fill(0),
+    );
+
+    const opaque = rgbaBuffer(4, 4, 40);
+    const opaqueResult = pixelizeBuffer(opaque, {
+      pixelSize: 2,
+      offsetX: 0,
+      offsetY: 0,
+      samplingMode: "smart",
+    });
+    expect(opaqueResult.data[3]).toBe(255);
+  });
+
 });
