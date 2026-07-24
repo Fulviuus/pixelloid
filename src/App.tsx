@@ -21,6 +21,7 @@ import {
   Upload,
   WandSparkles,
 } from "lucide-react";
+import pixelloidWordmark from "./assets/pixelloid-wordmark-dark.png";
 import { PixelEditor } from "./components/PixelEditor";
 import { PixelMark } from "./components/PixelMark";
 import {
@@ -860,10 +861,13 @@ function App() {
     <div className="app-shell">
       <header className="app-header">
         <a className="brand" href="#" aria-label="Pixelloid home">
-          <span className="brand-mark">
-            <PixelMark size={25} />
+          <span className="brand-wordmark">
+            <img
+              alt=""
+              aria-hidden="true"
+              src={pixelloidWordmark}
+            />
           </span>
-          <span>PIXELLOID</span>
           <span className="version-badge">ALPHA</span>
         </a>
 
