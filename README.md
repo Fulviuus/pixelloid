@@ -25,7 +25,7 @@
 <p align="center">
   <img
     alt="Pixelloid converting pseudo-pixel art into a true-resolution image"
-    src="./docs/screenshots/converter.jpeg"
+    src="./docs/screenshots/converter-medoid.png"
     width="100%"
   />
 </p>
@@ -37,7 +37,7 @@
 <p align="center">
   <img
     alt="Pixelloid pixel editor with drawing tools and a source-derived color palette"
-    src="./docs/screenshots/pixel-editor.jpeg"
+    src="./docs/screenshots/pixel-editor-medoid.jpeg"
     width="100%"
   />
 </p>
