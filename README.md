@@ -20,6 +20,32 @@
   Turn enlarged, almost-pixel art into a true 1:1 pixel image.
 </p>
 
+## Screenshots
+
+<p align="center">
+  <img
+    alt="Pixelloid converting pseudo-pixel art into a true-resolution image"
+    src="./docs/screenshots/converter.jpeg"
+    width="100%"
+  />
+</p>
+
+<p align="center">
+  <em>Detect the source grid, remove the background, and compare the true-resolution result.</em>
+</p>
+
+<p align="center">
+  <img
+    alt="Pixelloid pixel editor with drawing tools and a source-derived color palette"
+    src="./docs/screenshots/pixel-editor.jpeg"
+    width="100%"
+  />
+</p>
+
+<p align="center">
+  <em>Edit individual pixels with pencil, fill, eyedropper, eraser, crop, zoom, and the source palette.</em>
+</p>
+
 ## What is Pixelloid?
 
 AI-generated pixel art often only looks pixel-perfect. Its apparent pixels are
