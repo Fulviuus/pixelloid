@@ -1823,8 +1823,7 @@ button:disabled {
   line-height: 1.65;
 }
 
-.magic-fix-status-card,
-.magic-fix-download-note {
+.magic-fix-status-card {
   display: flex;
   align-items: center;
   border: 1px solid #343944;
@@ -1834,20 +1833,17 @@ button:disabled {
   gap: 12px;
 }
 
-.magic-fix-status-card > svg,
-.magic-fix-download-note > svg {
+.magic-fix-status-card > svg {
   flex: none;
 }
 
-.magic-fix-status-card > div,
-.magic-fix-download-note > div {
+.magic-fix-status-card > div {
   display: grid;
   min-width: 0;
   gap: 4px;
 }
 
 .magic-fix-status-card strong,
-.magic-fix-download-note strong,
 .magic-fix-option strong {
   color: #c9ccd2;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
@@ -1855,8 +1851,7 @@ button:disabled {
   letter-spacing: 0.1em;
 }
 
-.magic-fix-status-card span,
-.magic-fix-download-note span {
+.magic-fix-status-card span {
   color: #777d88;
   font-size: 10px;
   line-height: 1.45;
@@ -1877,13 +1872,6 @@ button:disabled {
 .magic-fix-status-card.is-running {
   border-color: #554a72;
   color: #cbbcff;
-}
-
-.magic-fix-download-note {
-  margin-top: 11px;
-  border-color: #4b4637;
-  color: #d6bc70;
-  background: rgba(131, 109, 50, 0.08);
 }
 
 .magic-fix-option {
@@ -1952,21 +1940,6 @@ button:disabled {
   place-items: center;
   align-content: center;
   text-align: center;
-}
-
-.magic-fix-orbit {
-  display: grid;
-  width: 68px;
-  height: 68px;
-  margin-bottom: 20px;
-  place-items: center;
-  border: 1px solid #74629e;
-  color: #daccff;
-  background: rgba(168, 139, 255, 0.08);
-  box-shadow:
-    0 0 0 8px rgba(168, 139, 255, 0.025),
-    0 0 38px rgba(168, 139, 255, 0.12);
-  animation: magic-fix-pulse 1.8s ease-in-out infinite;
 }
 
 .magic-fix-running p {
@@ -2134,17 +2107,6 @@ button:disabled {
 @keyframes magic-fix-spin {
   to {
     transform: rotate(1turn);
-  }
-}
-
-@keyframes magic-fix-pulse {
-  0%,
-  100% {
-    transform: scale(1);
-  }
-
-  50% {
-    transform: scale(1.055);
   }
 }
 

@@ -34,6 +34,8 @@ export type PixelizeResult = {
   width: number;
   height: number;
   sourceGrid?: SourceGridMapping;
+  /** Logical pixels manually changed in the editor and protected from repair. */
+  protectedMask?: Uint8Array;
   crop?: {
     x: number;
     y: number;

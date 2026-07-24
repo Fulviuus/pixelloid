@@ -1298,6 +1298,7 @@ function App() {
         <PixelEditor
           palette={sourcePalette}
           result={result}
+          sourceFile={source.processingFile}
           sourceHeight={source.height}
           sourceUrl={source.url}
           sourceWidth={source.width}

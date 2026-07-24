@@ -6,39 +6,20 @@ import {
 } from "react";
 import {
   Check,
-  Cpu,
-  HardDriveDownload,
   LoaderCircle,
-  RotateCcw,
   Sparkles,
   X,
 } from "lucide-react";
 
-export type MagicFixPhase =
-  | "checking"
-  | "ready"
-  | "preparing"
-  | "running"
-  | "cancelling"
-  | "preview"
-  | "error";
-
-export type MagicFixRuntimeStatus = {
-  available: boolean;
-  modelCached: boolean;
-  pixelArtAdapterCached: boolean;
-  message: string;
-};
+export type MagicFixPhase = "ready" | "running" | "preview" | "error";
 
 export type MagicFixDialogProps = {
   phase: MagicFixPhase;
-  runtime: MagicFixRuntimeStatus | null;
   current: ImageData;
   candidate: ImageData | null;
-  stage: string | null;
+  summary: string | null;
   error: string | null;
   onRun: (lockPalette: boolean) => void;
-  onCancelRun: () => void;
   onAccept: () => void;
   onClose: () => void;
 };
@@ -60,13 +41,11 @@ function drawPreview(
 
 export function MagicFixDialog({
   phase,
-  runtime,
   current,
   candidate,
-  stage,
+  summary,
   error,
   onRun,
-  onCancelRun,
   onAccept,
   onClose,
 }: MagicFixDialogProps) {
@@ -74,10 +53,7 @@ export function MagicFixDialog({
   const currentCanvasRef = useRef<HTMLCanvasElement>(null);
   const candidateCanvasRef = useRef<HTMLCanvasElement>(null);
   const [lockPalette, setLockPalette] = useState(false);
-  const isBusy =
-    phase === "preparing" ||
-    phase === "running" ||
-    phase === "cancelling";
+  const isBusy = phase === "running";
 
   useEffect(() => {
     dialogRef.current?.focus();
@@ -129,12 +105,8 @@ export function MagicFixDialog({
       return;
     }
 
-    if (event.key !== "Escape") return;
-    event.preventDefault();
-    if (phase === "cancelling") return;
-    if (isBusy) {
-      onCancelRun();
-    } else {
+    if (event.key === "Escape") {
+      event.preventDefault();
       onClose();
     }
   }
@@ -144,7 +116,7 @@ export function MagicFixDialog({
       className="magic-fix-backdrop"
       onPointerDown={(event) => {
         event.stopPropagation();
-        if (event.target === event.currentTarget && !isBusy) onClose();
+        if (event.target === event.currentTarget) onClose();
       }}
     >
       <div
@@ -162,20 +134,19 @@ export function MagicFixDialog({
               <Sparkles size={17} />
             </span>
             <div>
-              <p>LOCAL AI · KLEIN 4B + PIXEL ART LORA</p>
+              <p>DETERMINISTIC · SOURCE-GRID RESTORATION</p>
               <h3 id="magic-fix-title">Magic Fix</h3>
             </div>
           </div>
           <span className="magic-fix-local-badge">
             <span aria-hidden="true" />
-            LOCAL ONLY
+            LOCAL · NO AI
           </span>
           <button
             className="magic-fix-close"
             type="button"
             aria-label="Close Magic Fix"
             onClick={onClose}
-            disabled={isBusy}
           >
             <X aria-hidden="true" size={18} />
           </button>
@@ -196,21 +167,21 @@ export function MagicFixDialog({
               <figure className="is-magic">
                 <figcaption>
                   <Sparkles aria-hidden="true" size={13} />
-                  MAGIC FIX
+                  RESTORED
                 </figcaption>
                 <div className="magic-fix-preview-frame">
                   <canvas
                     ref={candidateCanvasRef}
-                    aria-label="Magic Fix preview"
+                    aria-label="Deterministic Magic Fix preview"
                   />
                 </div>
               </figure>
             </div>
 
             <p className="magic-fix-preview-note">
-              The AI result has been collapsed back to{" "}
-              {candidate.width} × {candidate.height} true pixels. Nothing has
-              changed until you apply it.
+              {summary ??
+                `Source colors were resolved directly onto the existing ${candidate.width} × ${candidate.height} grid.`}{" "}
+              Nothing changes until you apply the result.
             </p>
 
             <footer className="magic-fix-actions">
@@ -220,14 +191,6 @@ export function MagicFixDialog({
                 onClick={onClose}
               >
                 DISCARD
-              </button>
-              <button
-                className="magic-fix-secondary"
-                type="button"
-                onClick={() => onRun(lockPalette)}
-              >
-                <RotateCcw aria-hidden="true" size={15} />
-                TRY AGAIN
               </button>
               <button
                 className="magic-fix-primary"
@@ -242,79 +205,37 @@ export function MagicFixDialog({
         ) : (
           <>
             <div className="magic-fix-body">
-              {phase === "checking" ? (
-                <div className="magic-fix-status-card is-running" role="status">
+              {isBusy ? (
+                <div className="magic-fix-running" role="status">
                   <LoaderCircle
                     className="magic-fix-spinner"
                     aria-hidden="true"
-                    size={21}
+                    size={24}
                   />
-                  <div>
-                    <strong>CHECKING LOCAL RUNTIME</strong>
-                    <span>Looking for the Apple Silicon model runner…</span>
-                  </div>
-                </div>
-              ) : isBusy ? (
-                <div className="magic-fix-running" role="status">
-                  <div className="magic-fix-orbit" aria-hidden="true">
-                    <Sparkles size={24} />
-                  </div>
-                  <p>
-                    {phase === "cancelling"
-                      ? "STOPPING MAGIC FIX"
-                      : stage ?? "RUNNING PIXEL ART MODEL"}
-                  </p>
+                  <p>ANALYZING SOURCE CELLS</p>
                   <span>
-                    {runtime?.modelCached &&
-                    runtime.pixelArtAdapterCached
-                      ? "The model and pixel-art adapter are working locally. Larger images take longer."
-                      : "First run: downloading and loading the local model files. This can take several minutes."}
+                    Separating coherent source colors from interpolation,
+                    halos and isolated noise.
                   </span>
                 </div>
               ) : (
                 <>
                   <p className="magic-fix-intro">
-                    FLUX compares your true-pixel edit with the original while
-                    a dedicated pixel-art adapter keeps the reconstruction
-                    crisp. Pixelloid then forces the result back onto the exact
-                    same pixel grid.
+                    Magic Fix examines every original source cell, weighs its
+                    clean interior more heavily than its edges, and keeps the
+                    strongest coherent color. Ambiguous cells remain unchanged.
                   </p>
 
-                  <div
-                    className={`magic-fix-status-card ${
-                      runtime?.available ? "is-ready" : "is-error"
-                    }`}
-                  >
-                    <Cpu aria-hidden="true" size={21} />
+                  <div className="magic-fix-status-card is-ready">
+                    <Sparkles aria-hidden="true" size={21} />
                     <div>
-                      <strong>
-                        {runtime?.available
-                          ? runtime.modelCached &&
-                            runtime.pixelArtAdapterCached
-                            ? "PIXEL ART MODEL READY"
-                            : "PIXEL ART MODEL AVAILABLE"
-                          : "LOCAL RUNTIME UNAVAILABLE"}
-                      </strong>
-                      <span>{runtime?.message ?? "Runtime check failed."}</span>
+                      <strong>READY · NO MODEL REQUIRED</strong>
+                      <span>
+                        The reconstruction is deterministic, offline and runs
+                        directly on the source image.
+                      </span>
                     </div>
                   </div>
-
-                  {runtime?.available &&
-                    (!runtime.modelCached ||
-                      !runtime.pixelArtAdapterCached) && (
-                    <div className="magic-fix-download-note">
-                      <HardDriveDownload aria-hidden="true" size={19} />
-                      <div>
-                        <strong>ONE-TIME LOCAL DOWNLOAD</strong>
-                        <span>
-                          {!runtime.modelCached
-                            ? "The first run downloads approximately 16.5 GB for FLUX.2 Klein and its pixel-art adapter."
-                            : "The first styled run downloads the approximately 325 MB pixel-art adapter."}{" "}
-                          It is cached locally for later fixes.
-                        </span>
-                      </div>
-                    </div>
-                  )}
 
                   <label className="magic-fix-option">
                     <input
@@ -323,14 +244,13 @@ export function MagicFixDialog({
                       onChange={(event) =>
                         setLockPalette(event.currentTarget.checked)
                       }
-                      disabled={!runtime?.available}
                     />
                     <span aria-hidden="true" />
                     <div>
                       <strong>LOCK TO CURRENT PALETTE</strong>
                       <small>
-                        Prevent new colors. Useful for strict palettes, but can
-                        remove subtle shading recovered from the original.
+                        Map recovered colors to the editor palette instead of
+                        introducing source variations.
                       </small>
                     </div>
                   </label>
@@ -345,36 +265,22 @@ export function MagicFixDialog({
             </div>
 
             <footer className="magic-fix-actions">
-              {isBusy ? (
-                <button
-                  className="magic-fix-secondary"
-                  type="button"
-                  onClick={onCancelRun}
-                  disabled={phase === "cancelling"}
-                >
-                  <X aria-hidden="true" size={15} />
-                  {phase === "cancelling" ? "STOPPING…" : "CANCEL"}
-                </button>
-              ) : (
-                <>
-                  <button
-                    className="magic-fix-secondary"
-                    type="button"
-                    onClick={onClose}
-                  >
-                    CANCEL
-                  </button>
-                  <button
-                    className="magic-fix-primary"
-                    type="button"
-                    onClick={() => onRun(lockPalette)}
-                    disabled={!runtime?.available || phase === "checking"}
-                  >
-                    <Sparkles aria-hidden="true" size={16} />
-                    {phase === "error" ? "TRY AGAIN" : "RUN MAGIC FIX"}
-                  </button>
-                </>
-              )}
+              <button
+                className="magic-fix-secondary"
+                type="button"
+                onClick={onClose}
+              >
+                CANCEL
+              </button>
+              <button
+                className="magic-fix-primary"
+                type="button"
+                onClick={() => onRun(lockPalette)}
+                disabled={isBusy}
+              >
+                <Sparkles aria-hidden="true" size={16} />
+                {phase === "error" ? "TRY AGAIN" : "ANALYZE SOURCE"}
+              </button>
             </footer>
           </>
         )}

@@ -28,16 +28,11 @@ import {
   type MagicFixPhase,
 } from "./MagicFixDialog";
 import {
-  cancelMagicFix,
-  collapseMagicFixResult,
-  getMagicFixStatus,
-  magicFixErrorMessage,
-  prepareMagicFixEdit,
-  prepareMagicFixOriginalReference,
-  runMagicFix,
-  type MagicFixProviderStatus,
-  type RgbaImageData,
-} from "../features/magic-fix";
+  getImageWorkerClient,
+  resetImageWorkerClient,
+  shouldFallbackFromImageWorker,
+} from "../lib/imageWorkerClient";
+import { reconstructSourceCells } from "../lib/cellReconstruction";
 import type { PixelizeResult } from "../lib/pixelize";
 
 type EditorTool = "pencil" | "fill" | "eyedropper" | "eraser" | "crop";
@@ -64,10 +59,12 @@ type CanvasSnapshot = {
   image: ImageData;
   size: CanvasSize;
   crop: ResultCrop;
+  protectedMask: Uint8Array;
 };
 
 export type PixelEditorProps = {
   result: PixelizeResult;
+  sourceFile: File;
   sourceUrl: string;
   sourceWidth: number;
   sourceHeight: number;
@@ -81,21 +78,6 @@ const WHEEL_ZOOM_THRESHOLD = 40;
 const MAX_BULK_EDIT_PIXELS = 4_000_000;
 const MAX_ORIGINAL_OVERLAY_PIXELS = 4_000_000;
 const MAX_ORIGINAL_OVERLAY_DIMENSION = 16_384;
-const MAGIC_FIX_TARGET_LONG_EDGE = 1_280;
-const MAGIC_FIX_MAX_LONG_EDGE = 1_536;
-const MAGIC_FIX_DIMENSION_MULTIPLE = 16;
-const MAGIC_FIX_PROMPT = [
-  "Pixel art sprite or scene, 16-bit pixel art, crisp game asset.",
-  "Image 1 is the current pixel-art reconstruction and defines the exact",
-  "silhouette, composition, crop, object placement, and square pixel-block",
-  "layout. Image 2 is the original artwork and defines the intended colors,",
-  "shading, textures, facial features, small objects, and fine visual details.",
-  "Reconstruct the artwork to match Image 2 as faithfully as possible while",
-  "strictly preserving Image 1's geometry, framing, hard square blocks, crisp",
-  "pixel-art boundaries, and background. Keep the same objects in the same",
-  "positions. Preserve all existing edits. Do not add, remove, move, smooth,",
-  "blur, crop, or reinterpret anything.",
-].join(" ");
 
 type ActivePointerInteraction =
   | { kind: "crop" }
@@ -119,6 +101,24 @@ function cropFromPoints(start: PixelPoint, end: PixelPoint): CropSelection {
     width: Math.abs(end.x - start.x) + 1,
     height: Math.abs(end.y - start.y) + 1,
   };
+}
+
+function cropMask(
+  mask: Uint8Array,
+  sourceWidth: number,
+  selection: CropSelection,
+) {
+  const cropped = new Uint8Array(selection.width * selection.height);
+
+  for (let y = 0; y < selection.height; y += 1) {
+    const sourceOffset = (selection.y + y) * sourceWidth + selection.x;
+    cropped.set(
+      mask.subarray(sourceOffset, sourceOffset + selection.width),
+      y * selection.width,
+    );
+  }
+
+  return cropped;
 }
 
 function normalizeHexColor(color: string) {
@@ -155,6 +155,7 @@ function floodFill(
   height: number,
   point: PixelPoint,
   color: string,
+  protectedMask?: Uint8Array,
 ) {
   const image = context.getImageData(0, 0, width, height);
   const pixels = image.data;
@@ -194,6 +195,7 @@ function floodFill(
     pixels[offset + 1] = replacement[1];
     pixels[offset + 2] = replacement[2];
     pixels[offset + 3] = replacement[3];
+    if (protectedMask) protectedMask[pixelIndex] = 1;
     queue[tail] = pixelIndex;
     tail += 1;
   }
@@ -376,6 +378,7 @@ function removeEdgeConnectedBackground(
   context: CanvasRenderingContext2D,
   width: number,
   height: number,
+  protectedMask?: Uint8Array,
 ) {
   const image = context.getImageData(0, 0, width, height);
   const pixels = image.data;
@@ -562,6 +565,7 @@ function removeEdgeConnectedBackground(
     pixels[offset + 1] = 0;
     pixels[offset + 2] = 0;
     pixels[offset + 3] = 0;
+    if (protectedMask) protectedMask[pixelIndex] = 1;
   }
 
   if (removedPixels > 0) context.putImageData(image, 0, 0);
@@ -757,156 +761,6 @@ function canvasToPng(canvas: HTMLCanvasElement) {
   });
 }
 
-function roundUpToMultiple(value: number, multiple: number) {
-  return Math.ceil(value / multiple) * multiple;
-}
-
-function magicFixModelCanvas(width: number, height: number) {
-  const longestEdge = Math.max(width, height);
-
-  if (longestEdge > MAGIC_FIX_MAX_LONG_EDGE) {
-    throw new RangeError("magic-fix-logical-image-too-large");
-  }
-
-  const scale = Math.max(
-    1,
-    Math.min(64, Math.floor(MAGIC_FIX_TARGET_LONG_EDGE / longestEdge)),
-  );
-
-  return {
-    width: Math.max(
-      64,
-      roundUpToMultiple(width * scale, MAGIC_FIX_DIMENSION_MULTIPLE),
-    ),
-    height: Math.max(
-      64,
-      roundUpToMultiple(height * scale, MAGIC_FIX_DIMENSION_MULTIPLE),
-    ),
-    dimensionMultiple: MAGIC_FIX_DIMENSION_MULTIPLE,
-    preserveIntegerScale: true,
-  };
-}
-
-function modelPaddingColor(image: ImageData) {
-  const corners = [
-    0,
-    (image.width - 1) * 4,
-    (image.height - 1) * image.width * 4,
-    (image.width * image.height - 1) * 4,
-  ];
-  let red = 0;
-  let green = 0;
-  let blue = 0;
-  let weight = 0;
-
-  for (const offset of corners) {
-    const alpha = image.data[offset + 3] / 255;
-    if (alpha <= 0) continue;
-    red += image.data[offset] * alpha;
-    green += image.data[offset + 1] * alpha;
-    blue += image.data[offset + 2] * alpha;
-    weight += alpha;
-  }
-
-  if (weight === 0) {
-    return [127, 127, 127, 255] as const;
-  }
-
-  return [
-    Math.round(red / weight),
-    Math.round(green / weight),
-    Math.round(blue / weight),
-    255,
-  ] as const;
-}
-
-function flattenForModel(
-  image: RgbaImageData,
-  background: readonly [number, number, number, number],
-) {
-  const data = new Uint8ClampedArray(image.data.length);
-
-  for (let offset = 0; offset < image.data.length; offset += 4) {
-    const alpha = image.data[offset + 3] / 255;
-    const inverseAlpha = 1 - alpha;
-    data[offset] = Math.round(
-      image.data[offset] * alpha + background[0] * inverseAlpha,
-    );
-    data[offset + 1] = Math.round(
-      image.data[offset + 1] * alpha + background[1] * inverseAlpha,
-    );
-    data[offset + 2] = Math.round(
-      image.data[offset + 2] * alpha + background[2] * inverseAlpha,
-    );
-    data[offset + 3] = 255;
-  }
-
-  return {
-    width: image.width,
-    height: image.height,
-    data,
-  };
-}
-
-function imageDataToPng(image: RgbaImageData) {
-  const canvas = document.createElement("canvas");
-  canvas.width = image.width;
-  canvas.height = image.height;
-  const context = canvas.getContext("2d");
-  if (!context) return Promise.reject(new Error("canvas-context-unavailable"));
-  context.putImageData(
-    new ImageData(
-      new Uint8ClampedArray(image.data),
-      image.width,
-      image.height,
-    ),
-    0,
-    0,
-  );
-  return canvasToPng(canvas);
-}
-
-async function blobToBase64(blob: Blob) {
-  const bytes = new Uint8Array(await blob.arrayBuffer());
-  const chunkSize = 0x8000;
-  let binary = "";
-
-  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-    binary += String.fromCharCode(
-      ...bytes.subarray(offset, offset + chunkSize),
-    );
-  }
-
-  return btoa(binary);
-}
-
-async function base64PngToImageData(encoded: string) {
-  const binary = atob(encoded);
-  const bytes = new Uint8Array(binary.length);
-
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-
-  const url = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
-  const image = new Image();
-  image.decoding = "async";
-  image.src = url;
-
-  try {
-    await image.decode();
-    const canvas = document.createElement("canvas");
-    canvas.width = image.naturalWidth;
-    canvas.height = image.naturalHeight;
-    const context = canvas.getContext("2d");
-    if (!context) throw new Error("canvas-context-unavailable");
-    context.drawImage(image, 0, 0);
-    return context.getImageData(0, 0, canvas.width, canvas.height);
-  } finally {
-    URL.revokeObjectURL(url);
-  }
-}
-
 function originalImageData(
   image: HTMLImageElement,
   width: number,
@@ -921,8 +775,36 @@ function originalImageData(
   return context.getImageData(0, 0, width, height);
 }
 
+function countChangedPixels(
+  first: Uint8ClampedArray,
+  second: Uint8ClampedArray,
+) {
+  const pixelCount = Math.min(first.length, second.length) / 4;
+  let changed = 0;
+  for (let index = 0; index < pixelCount; index += 1) {
+    const offset = index * 4;
+    if (
+      first[offset] !== second[offset] ||
+      first[offset + 1] !== second[offset + 1] ||
+      first[offset + 2] !== second[offset + 2] ||
+      first[offset + 3] !== second[offset + 3]
+    ) {
+      changed += 1;
+    }
+  }
+  return changed;
+}
+
+function protectedMaskForResult(result: PixelizeResult) {
+  const pixelCount = result.width * result.height;
+  return result.protectedMask?.length === pixelCount
+    ? result.protectedMask.slice()
+    : new Uint8Array(pixelCount);
+}
+
 export function PixelEditor({
   result,
+  sourceFile,
   sourceUrl,
   sourceWidth,
   sourceHeight,
@@ -942,11 +824,11 @@ export function PixelEditor({
   const cropStartRef = useRef<PixelPoint | null>(null);
   const pendingCanvasImageRef = useRef<ImageData | null>(null);
   const bulkUndoRef = useRef<CanvasSnapshot | null>(null);
+  const protectedMaskRef = useRef(protectedMaskForResult(result));
   const pendingZoomAnchorRef = useRef<ZoomAnchor | null>(null);
   const wheelDeltaRef = useRef(0);
   const magicFixGenerationRef = useRef(0);
-  const magicFixJobRef = useRef<string | null>(null);
-  const magicFixRunSettledRef = useRef<Promise<void> | null>(null);
+  const magicFixWorkerActiveRef = useRef(false);
   const magicFixTriggerRef = useRef<HTMLButtonElement>(null);
   const normalizedPalette = useMemo(
     () =>
@@ -993,19 +875,14 @@ export function PixelEditor({
   const [error, setError] = useState<string | null>(null);
   const [magicFixPhase, setMagicFixPhase] =
     useState<MagicFixPhase | null>(null);
-  const [magicFixRuntime, setMagicFixRuntime] =
-    useState<MagicFixProviderStatus | null>(null);
   const [magicFixCurrent, setMagicFixCurrent] =
     useState<ImageData | null>(null);
   const [magicFixCandidate, setMagicFixCandidate] =
     useState<ImageData | null>(null);
-  const [magicFixStage, setMagicFixStage] = useState<string | null>(null);
+  const [magicFixSummary, setMagicFixSummary] = useState<string | null>(null);
   const [magicFixError, setMagicFixError] = useState<string | null>(null);
   const isColorTool = tool === "pencil" || tool === "fill";
-  const isMagicFixBusy =
-    magicFixPhase === "preparing" ||
-    magicFixPhase === "running" ||
-    magicFixPhase === "cancelling";
+  const isMagicFixBusy = magicFixPhase === "running";
   const canvasDisplayWidth = canvasSize.width * zoom;
   const canvasDisplayHeight = canvasSize.height * zoom;
   const editorStatus =
@@ -1050,9 +927,10 @@ export function PixelEditor({
   useEffect(
     () => () => {
       magicFixGenerationRef.current += 1;
-      const jobId = magicFixJobRef.current;
-      magicFixJobRef.current = null;
-      if (jobId) void cancelMagicFix(jobId).catch(() => undefined);
+      if (magicFixWorkerActiveRef.current) {
+        magicFixWorkerActiveRef.current = false;
+        resetImageWorkerClient("Magic Fix was cancelled.");
+      }
     },
     [],
   );
@@ -1089,6 +967,7 @@ export function PixelEditor({
     setError(null);
     setNotice(null);
     bulkUndoRef.current = null;
+    protectedMaskRef.current = protectedMaskForResult(result);
     setCanUndoBulkEdit(false);
 
     image.onload = () => {
@@ -1230,11 +1109,13 @@ export function PixelEditor({
 
     if (drawingTool === "eraser") {
       context.clearRect(point.x, point.y, 1, 1);
+      protectedMaskRef.current[point.y * canvas.width + point.x] = 1;
       return;
     }
 
     context.fillStyle = color;
     context.fillRect(point.x, point.y, 1, 1);
+    protectedMaskRef.current[point.y * canvas.width + point.x] = 1;
   }
 
   function drawLine(
@@ -1327,11 +1208,12 @@ export function PixelEditor({
       image: context.getImageData(0, 0, canvas.width, canvas.height),
       size: { width: canvas.width, height: canvas.height },
       crop: { ...resultCrop },
+      protectedMask: protectedMaskRef.current.slice(),
     };
     setCanUndoBulkEdit(true);
   }
 
-  async function handleOpenMagicFix() {
+  function handleOpenMagicFix() {
     const canvas = canvasRef.current;
     const context = canvas?.getContext("2d");
     const original = originalImageRef.current;
@@ -1346,17 +1228,10 @@ export function PixelEditor({
       return;
     }
 
-    if (Math.max(canvas.width, canvas.height) > MAGIC_FIX_MAX_LONG_EDGE) {
-      setNotice(
-        `MAGIC FIX SUPPORTS UP TO ${MAGIC_FIX_MAX_LONG_EDGE} PIXELS ON THE LONG EDGE`,
-      );
-      return;
-    }
-
     cancelActivePointerInteraction();
     setCropSelection(null);
     hideOriginal();
-    const generation = ++magicFixGenerationRef.current;
+    magicFixGenerationRef.current += 1;
     const current = context.getImageData(
       0,
       0,
@@ -1365,68 +1240,23 @@ export function PixelEditor({
     );
     setMagicFixCurrent(current);
     setMagicFixCandidate(null);
-    setMagicFixRuntime(null);
+    setMagicFixSummary(null);
     setMagicFixError(null);
-    setMagicFixStage(null);
-    setMagicFixPhase("checking");
-
-    try {
-      const runtime = await getMagicFixStatus();
-      if (generation !== magicFixGenerationRef.current) return;
-      setMagicFixRuntime(runtime);
-      setMagicFixPhase("ready");
-    } catch (caughtError) {
-      if (generation !== magicFixGenerationRef.current) return;
-      setMagicFixRuntime({
-        available: false,
-        platformSupported: false,
-        uvPath: null,
-        modelCached: false,
-        pixelArtAdapterCached: false,
-        message: "The local model runner could not be checked.",
-      });
-      setMagicFixError(
-        magicFixErrorMessage(caughtError),
-      );
-      setMagicFixPhase("error");
-    }
+    setMagicFixPhase("ready");
   }
 
   function closeMagicFix() {
-    if (isMagicFixBusy) return;
     magicFixGenerationRef.current += 1;
-    magicFixJobRef.current = null;
-    magicFixRunSettledRef.current = null;
+    if (magicFixWorkerActiveRef.current) {
+      magicFixWorkerActiveRef.current = false;
+      resetImageWorkerClient("Magic Fix was cancelled.");
+    }
     setMagicFixPhase(null);
     setMagicFixCurrent(null);
     setMagicFixCandidate(null);
-    setMagicFixStage(null);
+    setMagicFixSummary(null);
     setMagicFixError(null);
     requestAnimationFrame(() => magicFixTriggerRef.current?.focus());
-  }
-
-  async function handleCancelMagicFix() {
-    const jobId = magicFixJobRef.current;
-    const runSettled = magicFixRunSettledRef.current;
-    ++magicFixGenerationRef.current;
-    setMagicFixPhase("cancelling");
-    setMagicFixStage("STOPPING LOCAL MODEL");
-
-    if (jobId) {
-      try {
-        await cancelMagicFix(jobId);
-      } catch {
-        // The process may already have exited; resetting the local UI is safe.
-      }
-    }
-    await runSettled;
-
-    magicFixJobRef.current = null;
-    magicFixRunSettledRef.current = null;
-    setMagicFixCandidate(null);
-    setMagicFixError(null);
-    setMagicFixStage(null);
-    setMagicFixPhase("ready");
   }
 
   async function handleRunMagicFix(lockPalette: boolean) {
@@ -1437,112 +1267,103 @@ export function PixelEditor({
       !canvas ||
       !original ||
       !current ||
-      !magicFixRuntime?.available ||
       isMagicFixBusy
     ) {
       return;
     }
 
     const generation = ++magicFixGenerationRef.current;
-    const jobId = crypto.randomUUID();
-    magicFixJobRef.current = jobId;
     setMagicFixCandidate(null);
+    setMagicFixSummary(null);
     setMagicFixError(null);
-    setMagicFixStage("PREPARING PIXEL REFERENCES");
-    setMagicFixPhase("preparing");
-    let runSettled: Promise<void> | null = null;
+    setMagicFixPhase("running");
 
     try {
-      const modelCanvas = magicFixModelCanvas(
-        current.width,
-        current.height,
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => resolve()),
       );
-      const paddingColor = modelPaddingColor(current);
-      const preparedCurrent = prepareMagicFixEdit(current, {
-        ...modelCanvas,
-        paddingColor,
-      });
-      const source = originalImageData(
-        original,
+      const ranges = currentSourceRanges(
+        result.sourceGrid,
+        resultCrop,
+        canvasSize,
         sourceWidth,
         sourceHeight,
       );
-      const preparedOriginal = prepareMagicFixOriginalReference(
-        source,
-        preparedCurrent.transform,
-        {
-          sourceGrid: result.sourceGrid,
-          resultCrop,
-          paddingColor,
-        },
-      );
-      const [currentPng, originalPng] = await Promise.all([
-        imageDataToPng(
-          flattenForModel(preparedCurrent.image, paddingColor),
-        ),
-        imageDataToPng(
-          flattenForModel(preparedOriginal, paddingColor),
-        ),
-      ]);
-      const [currentPngBase64, originalPngBase64] = await Promise.all([
-        blobToBase64(currentPng),
-        blobToBase64(originalPng),
-      ]);
+      const currentBuffer = {
+        width: current.width,
+        height: current.height,
+        data: new Uint8ClampedArray(current.data),
+      };
+      const protectedMask = protectedMaskRef.current.slice();
+      const crop = {
+        x: 0,
+        y: 0,
+        width: current.width,
+        height: current.height,
+      };
+      const worker = getImageWorkerClient();
+      let candidateData:
+        | Awaited<ReturnType<NonNullable<typeof worker>["reconstruct"]>>
+        | ReturnType<typeof reconstructSourceCells>;
 
-      if (generation !== magicFixGenerationRef.current) return;
-      setMagicFixStage(
-        !magicFixRuntime.modelCached
-          ? "DOWNLOADING FLUX.2 KLEIN · FIRST RUN"
-          : !magicFixRuntime.pixelArtAdapterCached
-            ? "SETTING UP PIXEL ART MODEL · FIRST RUN"
-            : "LOADING PIXEL ART MODEL",
-      );
-      setMagicFixPhase("running");
-
-      const runRequest = runMagicFix({
-        jobId,
-        currentPngBase64,
-        originalPngBase64,
-        width: preparedCurrent.transform.modelWidth,
-        height: preparedCurrent.transform.modelHeight,
-        prompt: MAGIC_FIX_PROMPT,
-      });
-      runSettled = runRequest.then(
-        () => undefined,
-        () => undefined,
-      );
-      magicFixRunSettledRef.current = runSettled;
-      const response = await runRequest;
-
-      if (generation !== magicFixGenerationRef.current) return;
-      setMagicFixStage("RESTORING TRUE PIXELS");
-      const generated = await base64PngToImageData(
-        response.outputPngBase64,
-      );
-      const candidateData = collapseMagicFixResult(
-        generated,
-        current,
-        preparedCurrent.transform,
-        lockPalette
-          ? {
-              palette: {
-                colors: normalizedPalette,
-                includeCurrentColors: true,
-              },
-              flattenedBackground: [
-                paddingColor[0],
-                paddingColor[1],
-                paddingColor[2],
-              ],
-            }
-          : {
-              flattenedBackground: [
-                paddingColor[0],
-                paddingColor[1],
-                paddingColor[2],
-              ],
+      if (worker) {
+        magicFixWorkerActiveRef.current = true;
+        try {
+          candidateData = await worker.reconstruct(sourceFile, {
+            expectedWidth: sourceWidth,
+            expectedHeight: sourceHeight,
+            current: currentBuffer,
+            xRanges: ranges.x,
+            yRanges: ranges.y,
+            crop,
+            protectedMask,
+            palette:
+              lockPalette && normalizedPalette.length > 0
+                ? normalizedPalette
+                : undefined,
+          });
+        } catch (caughtError) {
+          if (!shouldFallbackFromImageWorker(caughtError)) throw caughtError;
+          const source = originalImageData(
+            original,
+            sourceWidth,
+            sourceHeight,
+          );
+          candidateData = reconstructSourceCells(
+            source,
+            ranges.x,
+            ranges.y,
+            {
+              current: currentBuffer,
+              protectedMask,
+              palette:
+                lockPalette && normalizedPalette.length > 0
+                  ? normalizedPalette
+                  : undefined,
+              includeDecisions: false,
             },
-      );
+          );
+        } finally {
+          magicFixWorkerActiveRef.current = false;
+        }
+      } else {
+        const source = originalImageData(original, sourceWidth, sourceHeight);
+        candidateData = reconstructSourceCells(
+          source,
+          ranges.x,
+          ranges.y,
+          {
+            current: currentBuffer,
+            protectedMask,
+            palette:
+              lockPalette && normalizedPalette.length > 0
+                ? normalizedPalette
+                : undefined,
+            includeDecisions: false,
+          },
+        );
+      }
+
       const candidate = new ImageData(
         new Uint8ClampedArray(candidateData.data),
         candidateData.width,
@@ -1557,34 +1378,25 @@ export function PixelEditor({
         return;
       }
 
-      magicFixJobRef.current = null;
-      setMagicFixRuntime((runtime) =>
-        runtime
-          ? {
-              ...runtime,
-              modelCached: true,
-              pixelArtAdapterCached: true,
-            }
-          : runtime,
-      );
       setMagicFixCandidate(candidate);
-      setMagicFixStage(null);
+      const changedPixels =
+        "changedPixels" in candidateData
+          ? candidateData.changedPixels
+          : countChangedPixels(candidateData.data, current.data);
+      setMagicFixSummary(
+        changedPixels === 0
+          ? "Every cell already matches the strongest reliable source evidence."
+          : `${changedPixels.toLocaleString()} of ${(candidate.width * candidate.height).toLocaleString()} pixels have stronger source evidence.`,
+      );
       setMagicFixPhase("preview");
     } catch (caughtError) {
       if (generation !== magicFixGenerationRef.current) return;
-      magicFixJobRef.current = null;
-      const message = magicFixErrorMessage(caughtError);
       setMagicFixError(
-        message.includes("magic-fix-logical-image-too-large")
-          ? `Magic Fix supports true images up to ${MAGIC_FIX_MAX_LONG_EDGE} pixels on the long edge.`
-          : message || "The local model could not complete this fix.",
+        caughtError instanceof Error && caughtError.message
+          ? caughtError.message
+          : "The source cells could not be reconstructed.",
       );
-      setMagicFixStage(null);
       setMagicFixPhase("error");
-    } finally {
-      if (magicFixRunSettledRef.current === runSettled) {
-        magicFixRunSettledRef.current = null;
-      }
     }
   }
 
@@ -1649,18 +1461,21 @@ export function PixelEditor({
           canvas.width,
           canvas.height,
         );
+        const previousProtectedMask = protectedMaskRef.current.slice();
         const filledPixels = floodFill(
           context,
           canvas.width,
           canvas.height,
           point,
           selectedColor,
+          protectedMaskRef.current,
         );
         if (filledPixels > 0) {
           bulkUndoRef.current = {
             image: previousImage,
             size: { width: canvas.width, height: canvas.height },
             crop: { ...resultCrop },
+            protectedMask: previousProtectedMask,
           };
           setCanUndoBulkEdit(true);
         }
@@ -1890,6 +1705,11 @@ export function PixelEditor({
     } else {
       clearBulkUndo();
     }
+    protectedMaskRef.current = cropMask(
+      protectedMaskRef.current,
+      canvas.width,
+      selection,
+    );
     pendingCanvasImageRef.current = croppedImage;
     centerNextCanvasLayout();
     setCanvasSize({
@@ -1934,6 +1754,7 @@ export function PixelEditor({
         height: canvas.height,
         crop: resultCrop,
         sourceGrid: result.sourceGrid,
+        protectedMask: protectedMaskRef.current.slice(),
       };
       onApply(nextResult);
       setIsApplying(false);
@@ -1960,10 +1781,12 @@ export function PixelEditor({
       canvas.width,
       canvas.height,
     );
+    const previousProtectedMask = protectedMaskRef.current.slice();
     const removal = removeEdgeConnectedBackground(
       context,
       canvas.width,
       canvas.height,
+      protectedMaskRef.current,
     );
 
     if (removal.removedPixels > 0) {
@@ -1971,6 +1794,7 @@ export function PixelEditor({
         image: previousImage,
         size: { width: canvas.width, height: canvas.height },
         crop: { ...resultCrop },
+        protectedMask: previousProtectedMask,
       };
       setCanUndoBulkEdit(true);
       setNotice(
@@ -2007,6 +1831,7 @@ export function PixelEditor({
       setCanvasSize(snapshot.size);
     }
 
+    protectedMaskRef.current = snapshot.protectedMask.slice();
     setResultCrop(snapshot.crop);
     setCropSelection(null);
     setTool("pencil");
@@ -2229,15 +2054,13 @@ export function PixelEditor({
               ref={magicFixTriggerRef}
               className="pixel-editor-magic-button"
               type="button"
-              aria-label="Run local AI Magic Fix"
-              onClick={() => void handleOpenMagicFix()}
+              aria-label="Run deterministic Magic Fix"
+              onClick={handleOpenMagicFix}
               disabled={
                 !isReady ||
                 isApplying ||
                 originalImageRevision === 0 ||
-                cropSelection !== null ||
-                Math.max(canvasSize.width, canvasSize.height) >
-                  MAGIC_FIX_MAX_LONG_EDGE
+                cropSelection !== null
               }
             >
               <WandSparkles aria-hidden="true" size={17} />
@@ -2459,15 +2282,13 @@ export function PixelEditor({
         {magicFixPhase && magicFixCurrent && (
           <MagicFixDialog
             phase={magicFixPhase}
-            runtime={magicFixRuntime}
             current={magicFixCurrent}
             candidate={magicFixCandidate}
-            stage={magicFixStage}
+            summary={magicFixSummary}
             error={magicFixError}
             onRun={(lockPalette) =>
               void handleRunMagicFix(lockPalette)
             }
-            onCancelRun={() => void handleCancelMagicFix()}
             onAccept={handleAcceptMagicFix}
             onClose={closeMagicFix}
           />

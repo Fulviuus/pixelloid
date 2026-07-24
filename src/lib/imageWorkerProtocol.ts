@@ -2,8 +2,13 @@ import type {
   PixelGridDetection,
   PixelGridSettings,
   PixelGridSuggestion,
+  PixelBuffer,
 } from "./gridDetection";
 import type { CellRange } from "./pixelizeCore";
+import type {
+  ReconstructionCrop,
+  ReconstructionPaletteColor,
+} from "./cellReconstruction";
 
 export type SourceDimensions = {
   expectedWidth: number;
@@ -30,6 +35,19 @@ export type PixelizeImageResult = {
   yRanges: CellRange[];
 };
 
+export type ReconstructImageOptions = SourceDimensions & {
+  current: PixelBuffer;
+  xRanges: CellRange[];
+  yRanges: CellRange[];
+  crop: ReconstructionCrop;
+  protectedMask?: Uint8Array;
+  palette?: ReconstructionPaletteColor[];
+};
+
+export type ReconstructImageResult = PixelBuffer & {
+  changedPixels: number;
+};
+
 export type ImageWorkerErrorCode =
   | "DECODE_FAILED"
   | "DIMENSIONS_MISMATCH"
@@ -51,11 +69,22 @@ export type PixelizeImageRequest = {
   dimensions: SourceDimensions;
 };
 
-export type ImageWorkerRequest = AnalyzeImageRequest | PixelizeImageRequest;
+export type ReconstructImageRequest = {
+  id: number;
+  operation: "reconstruct";
+  file: File;
+  options: ReconstructImageOptions;
+};
+
+export type ImageWorkerRequest =
+  | AnalyzeImageRequest
+  | PixelizeImageRequest
+  | ReconstructImageRequest;
 
 export type ImageWorkerRequestPayload =
   | Omit<AnalyzeImageRequest, "id">
-  | Omit<PixelizeImageRequest, "id">;
+  | Omit<PixelizeImageRequest, "id">
+  | Omit<ReconstructImageRequest, "id">;
 
 export type ImageWorkerSuccess =
   | {
@@ -69,6 +98,12 @@ export type ImageWorkerSuccess =
       operation: "pixelize";
       ok: true;
       result: PixelizeImageResult;
+    }
+  | {
+      id: number;
+      operation: "reconstruct";
+      ok: true;
+      result: ReconstructImageResult;
     };
 
 export type ImageWorkerFailure = {

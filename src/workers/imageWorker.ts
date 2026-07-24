@@ -11,6 +11,7 @@ import {
 } from "../lib/imageWorkerProtocol";
 import { extractPaletteFromImageData } from "../lib/palette";
 import { pixelizeBuffer } from "../lib/pixelizeCore";
+import { reconstructSourceCells } from "../lib/cellReconstruction";
 
 const MAX_DETECTION_DIMENSION = 2048;
 const MAX_PALETTE_DIMENSION = 256;
@@ -197,6 +198,72 @@ async function pixelize(
   }
 }
 
+async function reconstruct(
+  request: Extract<ImageWorkerRequest, { operation: "reconstruct" }>,
+) {
+  const bitmap = await decodeFile(request.file);
+  let bitmapIsOpen = true;
+
+  try {
+    validateDimensions(bitmap, request.options);
+    const sourceCanvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const sourceContext = getContext(sourceCanvas);
+    sourceContext.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    bitmapIsOpen = false;
+
+    const sourcePixels = sourceContext.getImageData(
+      0,
+      0,
+      sourceCanvas.width,
+      sourceCanvas.height,
+    ) as PixelBuffer;
+    sourceCanvas.width = 1;
+    sourceCanvas.height = 1;
+
+    const result = reconstructSourceCells(
+      sourcePixels,
+      request.options.xRanges,
+      request.options.yRanges,
+      {
+        current: request.options.current,
+        protectedMask: request.options.protectedMask,
+        palette: request.options.palette,
+        crop: request.options.crop,
+        includeDecisions: false,
+      },
+    );
+    let changedPixels = 0;
+
+    for (
+      let index = 0;
+      index < request.options.current.width * request.options.current.height;
+      index += 1
+    ) {
+      const offset = index * 4;
+      if (
+        result.data[offset] !== request.options.current.data[offset] ||
+        result.data[offset + 1] !==
+          request.options.current.data[offset + 1] ||
+        result.data[offset + 2] !==
+          request.options.current.data[offset + 2] ||
+        result.data[offset + 3] !== request.options.current.data[offset + 3]
+      ) {
+        changedPixels += 1;
+      }
+    }
+
+    return {
+      width: result.width,
+      height: result.height,
+      data: result.data,
+      changedPixels,
+    };
+  } finally {
+    if (bitmapIsOpen) bitmap.close();
+  }
+}
+
 function serializeError(error: unknown) {
   if (error instanceof ImageProcessingError) {
     return {
@@ -232,8 +299,16 @@ workerScope.onmessage = (event) => {
           ok: true,
           result,
         });
-      } else {
+      } else if (request.operation === "pixelize") {
         const result = await pixelize(request);
+        workerScope.postMessage({
+          id: request.id,
+          operation: request.operation,
+          ok: true,
+          result,
+        });
+      } else {
+        const result = await reconstruct(request);
         workerScope.postMessage({
           id: request.id,
           operation: request.operation,

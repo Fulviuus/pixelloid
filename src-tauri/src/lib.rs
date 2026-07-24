@@ -1,19 +1,6 @@
-mod magic_fix;
-
-use magic_fix::{
-    magic_fix_cancel, magic_fix_diagnostics, magic_fix_run, magic_fix_status, MagicFixState,
-};
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(MagicFixState::default())
-        .invoke_handler(tauri::generate_handler![
-            magic_fix_status,
-            magic_fix_diagnostics,
-            magic_fix_run,
-            magic_fix_cancel
-        ])
         .setup(|app| {
             let window_config = app
                 .config()

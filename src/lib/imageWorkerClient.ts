@@ -7,6 +7,8 @@ import type {
   ImageWorkerRequestPayload,
   ImageWorkerResponse,
   PixelizeImageResult,
+  ReconstructImageOptions,
+  ReconstructImageResult,
   SourceDimensions,
 } from "./imageWorkerProtocol";
 
@@ -146,6 +148,14 @@ export class ImageWorkerClient {
       file,
       settings,
       dimensions,
+    });
+  }
+
+  reconstruct(file: File, options: ReconstructImageOptions) {
+    return this.request<ReconstructImageResult>({
+      operation: "reconstruct",
+      file,
+      options,
     });
   }
 
