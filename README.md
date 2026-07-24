@@ -162,3 +162,8 @@ tests/                       Grid, pixelization, and background-removal tests
   consistent lattice.
 
 Pixelloid is currently in alpha.
+
+## License
+
+Pixelloid is available under the
+[Mozilla Public License 2.0](LICENSE).
