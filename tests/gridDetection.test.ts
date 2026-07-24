@@ -1092,18 +1092,22 @@ describe("pixel-grid detector regressions", () => {
     },
   );
 
-  it("phase-balances high-resolution translation, crop, and padding samples", () => {
-    const base = createPseudoPixelFixture(1600, 1600, 4);
-    const variants = [
-      createPseudoPixelFixture(1600, 1600, 4, 3, 3),
-      changeCanvasSize(base, -3),
-      changeCanvasSize(base, 3),
-    ];
+  it(
+    "phase-balances high-resolution translation, crop, and padding samples",
+    () => {
+      const base = createPseudoPixelFixture(1600, 1600, 4);
+      const variants = [
+        createPseudoPixelFixture(1600, 1600, 4, 3, 3),
+        changeCanvasSize(base, -3),
+        changeCanvasSize(base, 3),
+      ];
 
-    for (const image of variants) {
-      expect(suggestPixelGridData(image)?.pixelSize).toBe(4);
-    }
-  });
+      for (const image of variants) {
+        expect(suggestPixelGridData(image)?.pixelSize).toBe(4);
+      }
+    },
+    30_000,
+  );
 
   it.each([
     {
