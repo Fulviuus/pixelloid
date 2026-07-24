@@ -7,8 +7,7 @@ import type {
   ImageWorkerRequestPayload,
   ImageWorkerResponse,
   PixelizeImageResult,
-  ReconstructImageOptions,
-  ReconstructImageResult,
+  RemoveBackgroundImageResult,
   SourceDimensions,
 } from "./imageWorkerProtocol";
 
@@ -151,11 +150,11 @@ export class ImageWorkerClient {
     });
   }
 
-  reconstruct(file: File, options: ReconstructImageOptions) {
-    return this.request<ReconstructImageResult>({
-      operation: "reconstruct",
+  removeBackground(file: File, dimensions: SourceDimensions) {
+    return this.request<RemoveBackgroundImageResult>({
+      operation: "removeBackground",
       file,
-      options,
+      dimensions,
     });
   }
 

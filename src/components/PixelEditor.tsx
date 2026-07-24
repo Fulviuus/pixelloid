@@ -13,26 +13,14 @@ import {
   Crop,
   Eraser,
   Eye,
-  ImageOff,
   PaintBucket,
   Pencil,
   Pipette,
   Undo2,
-  WandSparkles,
   X,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import {
-  MagicFixDialog,
-  type MagicFixPhase,
-} from "./MagicFixDialog";
-import {
-  getImageWorkerClient,
-  resetImageWorkerClient,
-  shouldFallbackFromImageWorker,
-} from "../lib/imageWorkerClient";
-import { reconstructSourceCells } from "../lib/cellReconstruction";
 import type { PixelizeResult } from "../lib/pixelize";
 
 type EditorTool = "pencil" | "fill" | "eyedropper" | "eraser" | "crop";
@@ -59,12 +47,10 @@ type CanvasSnapshot = {
   image: ImageData;
   size: CanvasSize;
   crop: ResultCrop;
-  protectedMask: Uint8Array;
 };
 
 export type PixelEditorProps = {
   result: PixelizeResult;
-  sourceFile: File;
   sourceUrl: string;
   sourceWidth: number;
   sourceHeight: number;
@@ -103,24 +89,6 @@ function cropFromPoints(start: PixelPoint, end: PixelPoint): CropSelection {
   };
 }
 
-function cropMask(
-  mask: Uint8Array,
-  sourceWidth: number,
-  selection: CropSelection,
-) {
-  const cropped = new Uint8Array(selection.width * selection.height);
-
-  for (let y = 0; y < selection.height; y += 1) {
-    const sourceOffset = (selection.y + y) * sourceWidth + selection.x;
-    cropped.set(
-      mask.subarray(sourceOffset, sourceOffset + selection.width),
-      y * selection.width,
-    );
-  }
-
-  return cropped;
-}
-
 function normalizeHexColor(color: string) {
   const trimmed = color.trim().toLowerCase();
 
@@ -155,7 +123,6 @@ function floodFill(
   height: number,
   point: PixelPoint,
   color: string,
-  protectedMask?: Uint8Array,
 ) {
   const image = context.getImageData(0, 0, width, height);
   const pixels = image.data;
@@ -195,7 +162,6 @@ function floodFill(
     pixels[offset + 1] = replacement[1];
     pixels[offset + 2] = replacement[2];
     pixels[offset + 3] = replacement[3];
-    if (protectedMask) protectedMask[pixelIndex] = 1;
     queue[tail] = pixelIndex;
     tail += 1;
   }
@@ -216,360 +182,6 @@ function floodFill(
 
   context.putImageData(image, 0, 0);
   return tail;
-}
-
-type RgbColor = {
-  red: number;
-  green: number;
-  blue: number;
-};
-
-type WeightedRgbColor = RgbColor & {
-  count: number;
-  key: number;
-};
-
-function weightedColorDistanceSquared(
-  first: RgbColor,
-  second: RgbColor,
-) {
-  const red = first.red - second.red;
-  const green = first.green - second.green;
-  const blue = first.blue - second.blue;
-  return red * red * 0.299 + green * green * 0.587 + blue * blue * 0.114;
-}
-
-function fitBorderModel(samples: RgbColor[], clusterCount: number) {
-  const histogram = new Map<number, WeightedRgbColor>();
-
-  for (const sample of samples) {
-    const key =
-      (Math.round(sample.red) << 16) |
-      (Math.round(sample.green) << 8) |
-      Math.round(sample.blue);
-    const color = histogram.get(key);
-
-    if (color) {
-      color.count += 1;
-    } else {
-      histogram.set(key, { ...sample, count: 1, key });
-    }
-  }
-
-  const colors = [...histogram.values()].sort(
-    (first, second) =>
-      second.count - first.count || first.key - second.key,
-  );
-  if (colors.length < clusterCount || colors.length === 0) return null;
-
-  const centers: RgbColor[] = [
-    {
-      red: colors[0].red,
-      green: colors[0].green,
-      blue: colors[0].blue,
-    },
-  ];
-
-  while (centers.length < clusterCount) {
-    let best = colors[0];
-    let bestScore = Number.NEGATIVE_INFINITY;
-
-    for (const color of colors) {
-      const nearestDistance = Math.min(
-        ...centers.map((center) =>
-          weightedColorDistanceSquared(color, center),
-        ),
-      );
-      const score = nearestDistance * color.count ** 0.2;
-      if (score > bestScore) {
-        best = color;
-        bestScore = score;
-      }
-    }
-
-    centers.push({
-      red: best.red,
-      green: best.green,
-      blue: best.blue,
-    });
-  }
-
-  const assignments = new Uint8Array(colors.length);
-  const clusterWeights = new Float64Array(clusterCount);
-
-  for (let iteration = 0; iteration < 12; iteration += 1) {
-    const redTotals = new Float64Array(clusterCount);
-    const greenTotals = new Float64Array(clusterCount);
-    const blueTotals = new Float64Array(clusterCount);
-    clusterWeights.fill(0);
-
-    for (let colorIndex = 0; colorIndex < colors.length; colorIndex += 1) {
-      const color = colors[colorIndex];
-      let bestCluster = 0;
-      let bestDistance = Number.POSITIVE_INFINITY;
-
-      for (
-        let clusterIndex = 0;
-        clusterIndex < centers.length;
-        clusterIndex += 1
-      ) {
-        const distance = weightedColorDistanceSquared(
-          color,
-          centers[clusterIndex],
-        );
-        if (distance < bestDistance) {
-          bestCluster = clusterIndex;
-          bestDistance = distance;
-        }
-      }
-
-      assignments[colorIndex] = bestCluster;
-      clusterWeights[bestCluster] += color.count;
-      redTotals[bestCluster] += color.red * color.count;
-      greenTotals[bestCluster] += color.green * color.count;
-      blueTotals[bestCluster] += color.blue * color.count;
-    }
-
-    for (
-      let clusterIndex = 0;
-      clusterIndex < centers.length;
-      clusterIndex += 1
-    ) {
-      const weight = clusterWeights[clusterIndex];
-      if (weight === 0) continue;
-      centers[clusterIndex] = {
-        red: redTotals[clusterIndex] / weight,
-        green: greenTotals[clusterIndex] / weight,
-        blue: blueTotals[clusterIndex] / weight,
-      };
-    }
-  }
-
-  const distances = samples
-    .map((sample) =>
-      Math.sqrt(
-        Math.min(
-          ...centers.map((center) =>
-            weightedColorDistanceSquared(sample, center),
-          ),
-        ),
-      ),
-    )
-    .sort((first, second) => first - second);
-  const percentileIndex = Math.min(
-    distances.length - 1,
-    Math.floor(distances.length * 0.95),
-  );
-  const totalWeight = clusterWeights.reduce(
-    (total, weight) => total + weight,
-    0,
-  );
-
-  return {
-    centers,
-    p95: distances[percentileIndex] ?? Number.POSITIVE_INFINITY,
-    clusterShares: [...clusterWeights].map(
-      (weight) => weight / Math.max(1, totalWeight),
-    ),
-  };
-}
-
-function removeEdgeConnectedBackground(
-  context: CanvasRenderingContext2D,
-  width: number,
-  height: number,
-  protectedMask?: Uint8Array,
-) {
-  const image = context.getImageData(0, 0, width, height);
-  const pixels = image.data;
-  const borderPixels: number[] = [];
-  let visiblePixels = 0;
-
-  for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
-    if (pixels[pixelIndex * 4 + 3] >= 16) {
-      visiblePixels += 1;
-    }
-  }
-
-  if (visiblePixels === 0) {
-    return { detected: true, removedPixels: 0, noOpaquePixels: true };
-  }
-
-  for (let x = 0; x < width; x += 1) {
-    borderPixels.push(x, (height - 1) * width + x);
-  }
-  for (let y = 1; y < height - 1; y += 1) {
-    borderPixels.push(y * width, y * width + width - 1);
-  }
-  const hasVisibleBorder = borderPixels.some(
-    (pixelIndex) => pixels[pixelIndex * 4 + 3] >= 16,
-  );
-
-  // Walk through transparent padding and model the first visible frontier.
-  // This handles an inset opaque backdrop without mistaking the empty outer
-  // ring for proof that no background remains.
-  const transparentVisited = new Uint8Array(width * height);
-  const frontierSeen = new Uint8Array(width * height);
-  const transparentQueue = new Uint32Array(width * height);
-  const frontierPixels: number[] = [];
-  const samples: RgbColor[] = [];
-  let transparentHead = 0;
-  let transparentTail = 0;
-
-  function visitExterior(pixelIndex: number) {
-    const offset = pixelIndex * 4;
-
-    if (pixels[offset + 3] < 16) {
-      if (transparentVisited[pixelIndex]) return;
-      transparentVisited[pixelIndex] = 1;
-      transparentQueue[transparentTail] = pixelIndex;
-      transparentTail += 1;
-      return;
-    }
-
-    if (frontierSeen[pixelIndex]) return;
-    frontierSeen[pixelIndex] = 1;
-    frontierPixels.push(pixelIndex);
-    samples.push({
-      red: pixels[offset],
-      green: pixels[offset + 1],
-      blue: pixels[offset + 2],
-    });
-  }
-
-  for (const pixelIndex of borderPixels) visitExterior(pixelIndex);
-
-  while (transparentHead < transparentTail) {
-    const pixelIndex = transparentQueue[transparentHead];
-    transparentHead += 1;
-    const x = pixelIndex % width;
-    const y = Math.floor(pixelIndex / width);
-
-    if (x > 0) visitExterior(pixelIndex - 1);
-    if (x + 1 < width) visitExterior(pixelIndex + 1);
-    if (y > 0) visitExterior(pixelIndex - width);
-    if (y + 1 < height) visitExterior(pixelIndex + width);
-  }
-
-  if (samples.length === 0) {
-    return { detected: false, removedPixels: 0, noOpaquePixels: false };
-  }
-
-  if (!hasVisibleBorder) {
-    let left = width;
-    let right = -1;
-    let top = height;
-    let bottom = -1;
-
-    for (const pixelIndex of frontierPixels) {
-      const x = pixelIndex % width;
-      const y = Math.floor(pixelIndex / width);
-      left = Math.min(left, x);
-      right = Math.max(right, x);
-      top = Math.min(top, y);
-      bottom = Math.max(bottom, y);
-    }
-
-    const spanX = Math.max(1, right - left + 1);
-    const spanY = Math.max(1, bottom - top + 1);
-    let horizontalEdges = 0;
-    let verticalEdges = 0;
-
-    for (const pixelIndex of frontierPixels) {
-      const x = pixelIndex % width;
-      const y = Math.floor(pixelIndex / width);
-      if (y === top || y === bottom) horizontalEdges += 1;
-      if (x === left || x === right) verticalEdges += 1;
-    }
-
-    // A transparent canvas around a sprite is already background-free. Only
-    // learn an inset background when the opaque frontier resembles a frame;
-    // otherwise a uniform sprite outline could be erased by mistake.
-    const frameCoverage = Math.min(
-      horizontalEdges / (spanX * 2),
-      verticalEdges / (spanY * 2),
-    );
-    const interiorCoverage = visiblePixels / (spanX * spanY);
-    if (frameCoverage < 0.45 || interiorCoverage < 0.65) {
-      return { detected: false, removedPixels: 0, noOpaquePixels: false };
-    }
-  }
-
-  let model: ReturnType<typeof fitBorderModel> = null;
-
-  for (let clusterCount = 1; clusterCount <= 4; clusterCount += 1) {
-    const candidate = fitBorderModel(samples, clusterCount);
-    if (!candidate) break;
-
-    const usefulClusters =
-      clusterCount === 1 ||
-      candidate.clusterShares.every((share) => share >= 0.08);
-    if (candidate.p95 <= 12 && usefulClusters) {
-      model = candidate;
-      break;
-    }
-  }
-
-  if (!model) {
-    return { detected: false, removedPixels: 0, noOpaquePixels: false };
-  }
-
-  const tolerance = Math.max(10, Math.min(24, model.p95 + 6));
-  const visited = new Uint8Array(width * height);
-  const queue = new Uint32Array(width * height);
-  let head = 0;
-  let tail = 0;
-  let removedPixels = 0;
-
-  function matchesBackground(pixelIndex: number) {
-    const offset = pixelIndex * 4;
-    if (pixels[offset + 3] < 16) return true;
-
-    const color = {
-      red: pixels[offset],
-      green: pixels[offset + 1],
-      blue: pixels[offset + 2],
-    };
-    return model!.centers.some(
-      (center) =>
-        Math.sqrt(weightedColorDistanceSquared(color, center)) <= tolerance,
-    );
-  }
-
-  function enqueue(pixelIndex: number) {
-    if (visited[pixelIndex] || !matchesBackground(pixelIndex)) return;
-    visited[pixelIndex] = 1;
-    queue[tail] = pixelIndex;
-    tail += 1;
-  }
-
-  for (const pixelIndex of borderPixels) enqueue(pixelIndex);
-
-  while (head < tail) {
-    const pixelIndex = queue[head];
-    head += 1;
-    const x = pixelIndex % width;
-    const y = Math.floor(pixelIndex / width);
-
-    if (x > 0) enqueue(pixelIndex - 1);
-    if (x + 1 < width) enqueue(pixelIndex + 1);
-    if (y > 0) enqueue(pixelIndex - width);
-    if (y + 1 < height) enqueue(pixelIndex + width);
-  }
-
-  for (let pixelIndex = 0; pixelIndex < visited.length; pixelIndex += 1) {
-    if (!visited[pixelIndex]) continue;
-    const offset = pixelIndex * 4;
-    if (pixels[offset + 3] > 0) removedPixels += 1;
-    pixels[offset] = 0;
-    pixels[offset + 1] = 0;
-    pixels[offset + 2] = 0;
-    pixels[offset + 3] = 0;
-    if (protectedMask) protectedMask[pixelIndex] = 1;
-  }
-
-  if (removedPixels > 0) context.putImageData(image, 0, 0);
-  return { detected: true, removedPixels, noOpaquePixels: false };
 }
 
 function initialZoom(width: number, height: number) {
@@ -761,50 +373,8 @@ function canvasToPng(canvas: HTMLCanvasElement) {
   });
 }
 
-function originalImageData(
-  image: HTMLImageElement,
-  width: number,
-  height: number,
-) {
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const context = canvas.getContext("2d", { willReadFrequently: true });
-  if (!context) throw new Error("canvas-context-unavailable");
-  context.drawImage(image, 0, 0, width, height);
-  return context.getImageData(0, 0, width, height);
-}
-
-function countChangedPixels(
-  first: Uint8ClampedArray,
-  second: Uint8ClampedArray,
-) {
-  const pixelCount = Math.min(first.length, second.length) / 4;
-  let changed = 0;
-  for (let index = 0; index < pixelCount; index += 1) {
-    const offset = index * 4;
-    if (
-      first[offset] !== second[offset] ||
-      first[offset + 1] !== second[offset + 1] ||
-      first[offset + 2] !== second[offset + 2] ||
-      first[offset + 3] !== second[offset + 3]
-    ) {
-      changed += 1;
-    }
-  }
-  return changed;
-}
-
-function protectedMaskForResult(result: PixelizeResult) {
-  const pixelCount = result.width * result.height;
-  return result.protectedMask?.length === pixelCount
-    ? result.protectedMask.slice()
-    : new Uint8Array(pixelCount);
-}
-
 export function PixelEditor({
   result,
-  sourceFile,
   sourceUrl,
   sourceWidth,
   sourceHeight,
@@ -824,12 +394,8 @@ export function PixelEditor({
   const cropStartRef = useRef<PixelPoint | null>(null);
   const pendingCanvasImageRef = useRef<ImageData | null>(null);
   const bulkUndoRef = useRef<CanvasSnapshot | null>(null);
-  const protectedMaskRef = useRef(protectedMaskForResult(result));
   const pendingZoomAnchorRef = useRef<ZoomAnchor | null>(null);
   const wheelDeltaRef = useRef(0);
-  const magicFixGenerationRef = useRef(0);
-  const magicFixWorkerActiveRef = useRef(false);
-  const magicFixTriggerRef = useRef<HTMLButtonElement>(null);
   const normalizedPalette = useMemo(
     () =>
       Array.from(
@@ -873,16 +439,7 @@ export function PixelEditor({
   const [canUndoBulkEdit, setCanUndoBulkEdit] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [magicFixPhase, setMagicFixPhase] =
-    useState<MagicFixPhase | null>(null);
-  const [magicFixCurrent, setMagicFixCurrent] =
-    useState<ImageData | null>(null);
-  const [magicFixCandidate, setMagicFixCandidate] =
-    useState<ImageData | null>(null);
-  const [magicFixSummary, setMagicFixSummary] = useState<string | null>(null);
-  const [magicFixError, setMagicFixError] = useState<string | null>(null);
   const isColorTool = tool === "pencil" || tool === "fill";
-  const isMagicFixBusy = magicFixPhase === "running";
   const canvasDisplayWidth = canvasSize.width * zoom;
   const canvasDisplayHeight = canvasSize.height * zoom;
   const editorStatus =
@@ -924,17 +481,6 @@ export function PixelEditor({
     };
   }, []);
 
-  useEffect(
-    () => () => {
-      magicFixGenerationRef.current += 1;
-      if (magicFixWorkerActiveRef.current) {
-        magicFixWorkerActiveRef.current = false;
-        resetImageWorkerClient("Magic Fix was cancelled.");
-      }
-    },
-    [],
-  );
-
   useEffect(() => {
     let isCurrent = true;
     const image = new Image();
@@ -967,7 +513,6 @@ export function PixelEditor({
     setError(null);
     setNotice(null);
     bulkUndoRef.current = null;
-    protectedMaskRef.current = protectedMaskForResult(result);
     setCanUndoBulkEdit(false);
 
     image.onload = () => {
@@ -1109,13 +654,11 @@ export function PixelEditor({
 
     if (drawingTool === "eraser") {
       context.clearRect(point.x, point.y, 1, 1);
-      protectedMaskRef.current[point.y * canvas.width + point.x] = 1;
       return;
     }
 
     context.fillStyle = color;
     context.fillRect(point.x, point.y, 1, 1);
-    protectedMaskRef.current[point.y * canvas.width + point.x] = 1;
   }
 
   function drawLine(
@@ -1208,217 +751,8 @@ export function PixelEditor({
       image: context.getImageData(0, 0, canvas.width, canvas.height),
       size: { width: canvas.width, height: canvas.height },
       crop: { ...resultCrop },
-      protectedMask: protectedMaskRef.current.slice(),
     };
     setCanUndoBulkEdit(true);
-  }
-
-  function handleOpenMagicFix() {
-    const canvas = canvasRef.current;
-    const context = canvas?.getContext("2d");
-    const original = originalImageRef.current;
-    if (
-      !canvas ||
-      !context ||
-      !original ||
-      !isReady ||
-      isApplying ||
-      magicFixPhase !== null
-    ) {
-      return;
-    }
-
-    cancelActivePointerInteraction();
-    setCropSelection(null);
-    hideOriginal();
-    magicFixGenerationRef.current += 1;
-    const current = context.getImageData(
-      0,
-      0,
-      canvas.width,
-      canvas.height,
-    );
-    setMagicFixCurrent(current);
-    setMagicFixCandidate(null);
-    setMagicFixSummary(null);
-    setMagicFixError(null);
-    setMagicFixPhase("ready");
-  }
-
-  function closeMagicFix() {
-    magicFixGenerationRef.current += 1;
-    if (magicFixWorkerActiveRef.current) {
-      magicFixWorkerActiveRef.current = false;
-      resetImageWorkerClient("Magic Fix was cancelled.");
-    }
-    setMagicFixPhase(null);
-    setMagicFixCurrent(null);
-    setMagicFixCandidate(null);
-    setMagicFixSummary(null);
-    setMagicFixError(null);
-    requestAnimationFrame(() => magicFixTriggerRef.current?.focus());
-  }
-
-  async function handleRunMagicFix(lockPalette: boolean) {
-    const canvas = canvasRef.current;
-    const original = originalImageRef.current;
-    const current = magicFixCurrent;
-    if (
-      !canvas ||
-      !original ||
-      !current ||
-      isMagicFixBusy
-    ) {
-      return;
-    }
-
-    const generation = ++magicFixGenerationRef.current;
-    setMagicFixCandidate(null);
-    setMagicFixSummary(null);
-    setMagicFixError(null);
-    setMagicFixPhase("running");
-
-    try {
-      await new Promise<void>((resolve) =>
-        requestAnimationFrame(() => resolve()),
-      );
-      const ranges = currentSourceRanges(
-        result.sourceGrid,
-        resultCrop,
-        canvasSize,
-        sourceWidth,
-        sourceHeight,
-      );
-      const currentBuffer = {
-        width: current.width,
-        height: current.height,
-        data: new Uint8ClampedArray(current.data),
-      };
-      const protectedMask = protectedMaskRef.current.slice();
-      const crop = {
-        x: 0,
-        y: 0,
-        width: current.width,
-        height: current.height,
-      };
-      const worker = getImageWorkerClient();
-      let candidateData:
-        | Awaited<ReturnType<NonNullable<typeof worker>["reconstruct"]>>
-        | ReturnType<typeof reconstructSourceCells>;
-
-      if (worker) {
-        magicFixWorkerActiveRef.current = true;
-        try {
-          candidateData = await worker.reconstruct(sourceFile, {
-            expectedWidth: sourceWidth,
-            expectedHeight: sourceHeight,
-            current: currentBuffer,
-            xRanges: ranges.x,
-            yRanges: ranges.y,
-            crop,
-            protectedMask,
-            palette:
-              lockPalette && normalizedPalette.length > 0
-                ? normalizedPalette
-                : undefined,
-          });
-        } catch (caughtError) {
-          if (!shouldFallbackFromImageWorker(caughtError)) throw caughtError;
-          const source = originalImageData(
-            original,
-            sourceWidth,
-            sourceHeight,
-          );
-          candidateData = reconstructSourceCells(
-            source,
-            ranges.x,
-            ranges.y,
-            {
-              current: currentBuffer,
-              protectedMask,
-              palette:
-                lockPalette && normalizedPalette.length > 0
-                  ? normalizedPalette
-                  : undefined,
-              includeDecisions: false,
-            },
-          );
-        } finally {
-          magicFixWorkerActiveRef.current = false;
-        }
-      } else {
-        const source = originalImageData(original, sourceWidth, sourceHeight);
-        candidateData = reconstructSourceCells(
-          source,
-          ranges.x,
-          ranges.y,
-          {
-            current: currentBuffer,
-            protectedMask,
-            palette:
-              lockPalette && normalizedPalette.length > 0
-                ? normalizedPalette
-                : undefined,
-            includeDecisions: false,
-          },
-        );
-      }
-
-      const candidate = new ImageData(
-        new Uint8ClampedArray(candidateData.data),
-        candidateData.width,
-        candidateData.height,
-      );
-
-      if (
-        generation !== magicFixGenerationRef.current ||
-        candidate.width !== canvas.width ||
-        candidate.height !== canvas.height
-      ) {
-        return;
-      }
-
-      setMagicFixCandidate(candidate);
-      const changedPixels =
-        "changedPixels" in candidateData
-          ? candidateData.changedPixels
-          : countChangedPixels(candidateData.data, current.data);
-      setMagicFixSummary(
-        changedPixels === 0
-          ? "Every cell already matches the strongest reliable source evidence."
-          : `${changedPixels.toLocaleString()} of ${(candidate.width * candidate.height).toLocaleString()} pixels have stronger source evidence.`,
-      );
-      setMagicFixPhase("preview");
-    } catch (caughtError) {
-      if (generation !== magicFixGenerationRef.current) return;
-      setMagicFixError(
-        caughtError instanceof Error && caughtError.message
-          ? caughtError.message
-          : "The source cells could not be reconstructed.",
-      );
-      setMagicFixPhase("error");
-    }
-  }
-
-  function handleAcceptMagicFix() {
-    const canvas = canvasRef.current;
-    const context = canvas?.getContext("2d");
-    const candidate = magicFixCandidate;
-    if (
-      !canvas ||
-      !context ||
-      !candidate ||
-      candidate.width !== canvas.width ||
-      candidate.height !== canvas.height
-    ) {
-      return;
-    }
-
-    storeBulkUndo(context, canvas);
-    context.clearRect(0, 0, canvas.width, canvas.height);
-    context.putImageData(candidate, 0, 0);
-    setNotice("MAGIC FIX APPLIED · UNDO AVAILABLE");
-    closeMagicFix();
   }
 
   function handlePointerDown(event: ReactPointerEvent<HTMLCanvasElement>) {
@@ -1461,21 +795,18 @@ export function PixelEditor({
           canvas.width,
           canvas.height,
         );
-        const previousProtectedMask = protectedMaskRef.current.slice();
         const filledPixels = floodFill(
           context,
           canvas.width,
           canvas.height,
           point,
           selectedColor,
-          protectedMaskRef.current,
         );
         if (filledPixels > 0) {
           bulkUndoRef.current = {
             image: previousImage,
             size: { width: canvas.width, height: canvas.height },
             crop: { ...resultCrop },
-            protectedMask: previousProtectedMask,
           };
           setCanUndoBulkEdit(true);
         }
@@ -1629,11 +960,6 @@ export function PixelEditor({
     setShowOriginal((visible) => !visible);
   }
 
-  function hideOriginal() {
-    if (!showOriginal) return;
-    setShowOriginal(false);
-  }
-
   function centerNextCanvasLayout() {
     const scroller = canvasScrollRef.current;
     if (!scroller) return;
@@ -1705,11 +1031,6 @@ export function PixelEditor({
     } else {
       clearBulkUndo();
     }
-    protectedMaskRef.current = cropMask(
-      protectedMaskRef.current,
-      canvas.width,
-      selection,
-    );
     pendingCanvasImageRef.current = croppedImage;
     centerNextCanvasLayout();
     setCanvasSize({
@@ -1754,7 +1075,6 @@ export function PixelEditor({
         height: canvas.height,
         crop: resultCrop,
         sourceGrid: result.sourceGrid,
-        protectedMask: protectedMaskRef.current.slice(),
       };
       onApply(nextResult);
       setIsApplying(false);
@@ -1763,54 +1083,6 @@ export function PixelEditor({
       setError("The edited image could not be exported.");
       setIsApplying(false);
     }
-  }
-
-  function handleRemoveBackground() {
-    const canvas = canvasRef.current;
-    const context = canvas?.getContext("2d");
-    if (!canvas || !context || !isReady || isApplying) return;
-
-    if (canvas.width * canvas.height > MAX_BULK_EDIT_PIXELS) {
-      setNotice("BACKGROUND REMOVAL IS LIMITED TO 4 MEGAPIXELS");
-      return;
-    }
-
-    const previousImage = context.getImageData(
-      0,
-      0,
-      canvas.width,
-      canvas.height,
-    );
-    const previousProtectedMask = protectedMaskRef.current.slice();
-    const removal = removeEdgeConnectedBackground(
-      context,
-      canvas.width,
-      canvas.height,
-      protectedMaskRef.current,
-    );
-
-    if (removal.removedPixels > 0) {
-      bulkUndoRef.current = {
-        image: previousImage,
-        size: { width: canvas.width, height: canvas.height },
-        crop: { ...resultCrop },
-        protectedMask: previousProtectedMask,
-      };
-      setCanUndoBulkEdit(true);
-      setNotice(
-        `REMOVED ${removal.removedPixels.toLocaleString()} BACKGROUND PIXELS`,
-      );
-    } else {
-      setNotice(
-        removal.noOpaquePixels
-          ? "NO OPAQUE BACKGROUND REMAINS"
-          : removal.detected
-            ? "NO MATCHING EDGE BACKGROUND FOUND"
-            : "NO UNIFORM EDGE BACKGROUND FOUND",
-      );
-    }
-    setCropSelection(null);
-    hideOriginal();
   }
 
   function handleUndoBulkEdit() {
@@ -1831,7 +1103,6 @@ export function PixelEditor({
       setCanvasSize(snapshot.size);
     }
 
-    protectedMaskRef.current = snapshot.protectedMask.slice();
     setResultCrop(snapshot.crop);
     setCropSelection(null);
     setTool("pencil");
@@ -1939,11 +1210,7 @@ export function PixelEditor({
         tabIndex={-1}
         onKeyDown={handleDialogKeyDown}
       >
-        <div
-          className="pixel-editor-main"
-          inert={magicFixPhase ? true : undefined}
-          aria-hidden={magicFixPhase ? true : undefined}
-        >
+        <div className="pixel-editor-main">
         <header className="pixel-editor-header">
           <div>
             <p className="pixel-editor-kicker">PIXEL EDITOR</p>
@@ -2049,32 +1316,6 @@ export function PixelEditor({
               <Eye aria-hidden="true" size={17} />
               <span>ORIGINAL</span>
               <kbd>O</kbd>
-            </button>
-            <button
-              ref={magicFixTriggerRef}
-              className="pixel-editor-magic-button"
-              type="button"
-              aria-label="Run deterministic Magic Fix"
-              onClick={handleOpenMagicFix}
-              disabled={
-                !isReady ||
-                isApplying ||
-                originalImageRevision === 0 ||
-                cropSelection !== null
-              }
-            >
-              <WandSparkles aria-hidden="true" size={17} />
-              <span>MAGIC FIX</span>
-            </button>
-            <button
-              className="pixel-editor-background-button"
-              type="button"
-              aria-label="Remove edge-connected background"
-              onClick={handleRemoveBackground}
-              disabled={!isReady || isApplying}
-            >
-              <ImageOff aria-hidden="true" size={17} />
-              <span>REMOVE BG</span>
             </button>
             <button
               className="pixel-editor-undo-button"
@@ -2279,20 +1520,6 @@ export function PixelEditor({
         </footer>
         </div>
 
-        {magicFixPhase && magicFixCurrent && (
-          <MagicFixDialog
-            phase={magicFixPhase}
-            current={magicFixCurrent}
-            candidate={magicFixCandidate}
-            summary={magicFixSummary}
-            error={magicFixError}
-            onRun={(lockPalette) =>
-              void handleRunMagicFix(lockPalette)
-            }
-            onAccept={handleAcceptMagicFix}
-            onClose={closeMagicFix}
-          />
-        )}
       </div>
     </div>
   );

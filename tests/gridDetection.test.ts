@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  alignPixelGridPhaseData,
   analyzePixelGridData,
   buildCellRanges,
   detectPixelGridData,
@@ -88,6 +89,55 @@ function createGridFixture({
   }
 
   return { width, height, data };
+}
+
+function createConflictingCanvasPhaseFixture(): PixelBuffer {
+  const width = 250;
+  const height = 250;
+  const pitch = 8;
+  const spriteLeft = 61;
+  const spriteTop = 61;
+  const spriteRight = spriteLeft + 16 * pitch;
+  const spriteBottom = spriteTop + 16 * pitch;
+  const image = createGridFixture({
+    width,
+    height,
+    pitch,
+    offsetX: spriteLeft,
+    offsetY: spriteTop,
+    sprite: {
+      left: spriteLeft,
+      top: spriteTop,
+      columns: 16,
+      rows: 16,
+    },
+  });
+
+  // The pale checker is a plausible generated-image background with a phase
+  // of zero. It must not replace the sprite's own phase of 61 % 8 = 5.
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (
+        x >= spriteLeft &&
+        x < spriteRight &&
+        y >= spriteTop &&
+        y < spriteBottom
+      ) {
+        continue;
+      }
+
+      const index = (y * width + x) * 4;
+      const checkerIsDark =
+        (Math.floor(x / pitch) + Math.floor(y / pitch)) % 2 === 0;
+      const channel = checkerIsDark ? 235 : 255;
+      image.data[index] = channel;
+      image.data[index + 1] = channel;
+      image.data[index + 2] = channel;
+      image.data[index + 3] = checkerIsDark ? 245 : 255;
+    }
+  }
+
+  return image;
 }
 
 function createGradientFixture(
@@ -602,6 +652,56 @@ describe("pixel-grid detector regressions", () => {
 
     expect(detection.offsetX).toBeCloseTo(5, 0);
     expect(detection.offsetY).toBeCloseTo(5, 0);
+  });
+
+  it("keeps foreground phase when a pale canvas checker has another phase", () => {
+    const detection = expectPitch(
+      createConflictingCanvasPhaseFixture(),
+      8,
+      0.08,
+    );
+
+    expect(detection.offsetX).toBeCloseTo(5, 0);
+    expect(detection.offsetY).toBeCloseTo(5, 0);
+  });
+
+  it("realigns a known pitch to transparent foreground after cleanup", () => {
+    const image = createGridFixture({
+      width: 250,
+      height: 250,
+      pitch: 8,
+      offsetX: 61,
+      offsetY: 61,
+      sprite: { left: 61, top: 61, columns: 16, rows: 16 },
+      transparentBackground: true,
+    });
+
+    expect(alignPixelGridPhaseData(image, 8)).toMatchObject({
+      pixelSize: 8,
+      offsetX: 5,
+      offsetY: 5,
+    });
+  });
+
+  it("balances an irregular transparent foreground across logical samples", () => {
+    const image = {
+      width: 60,
+      height: 75,
+      data: new Uint8ClampedArray(60 * 75 * 4),
+    };
+
+    for (let y = 8; y <= 61; y += 1) {
+      for (let x = 12; x <= 34; x += 1) {
+        const offset = (y * image.width + x) * 4;
+        image.data.set([220, 140, 40, 255], offset);
+      }
+    }
+
+    expect(alignPixelGridPhaseData(image, 15)).toEqual({
+      pixelSize: 15,
+      offsetX: 8,
+      offsetY: 4,
+    });
   });
 
   it("refines a full-bleed 1000/96 fractional pitch", () => {

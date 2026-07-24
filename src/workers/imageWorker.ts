@@ -1,4 +1,5 @@
 import {
+  alignPixelGridPhaseData,
   analyzePixelGridData,
   buildCellRanges,
   type PixelBuffer,
@@ -11,7 +12,7 @@ import {
 } from "../lib/imageWorkerProtocol";
 import { extractPaletteFromImageData } from "../lib/palette";
 import { pixelizeBuffer } from "../lib/pixelizeCore";
-import { reconstructSourceCells } from "../lib/cellReconstruction";
+import { removeEdgeConnectedBackground } from "../lib/backgroundRemoval";
 
 const MAX_DETECTION_DIMENSION = 2048;
 const MAX_PALETTE_DIMENSION = 256;
@@ -108,12 +109,24 @@ async function analyze(request: Extract<ImageWorkerRequest, { operation: "analyz
       bitmap.width,
       bitmap.height,
     );
+    const phaseAlignments = (request.options.phasePixelSizes ?? [])
+      .slice(0, 3)
+      .map((pixelSize) =>
+        alignPixelGridPhaseData(
+          analysisPixels,
+          pixelSize,
+          bitmap.width,
+          bitmap.height,
+        ),
+      )
+      .filter((alignment) => alignment !== null);
 
     return {
       sourceWidth: bitmap.width,
       sourceHeight: bitmap.height,
       detection: gridAnalysis.detection,
       suggestion: gridAnalysis.suggestion,
+      phaseAlignments,
       palette: extractPaletteFromImageData(
         palettePixels,
         request.options.maximumColors ?? DEFAULT_MAXIMUM_COLORS,
@@ -198,66 +211,51 @@ async function pixelize(
   }
 }
 
-async function reconstruct(
-  request: Extract<ImageWorkerRequest, { operation: "reconstruct" }>,
+async function removeBackground(
+  request: Extract<ImageWorkerRequest, { operation: "removeBackground" }>,
 ) {
   const bitmap = await decodeFile(request.file);
   let bitmapIsOpen = true;
 
   try {
-    validateDimensions(bitmap, request.options);
-    const sourceCanvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-    const sourceContext = getContext(sourceCanvas);
-    sourceContext.drawImage(bitmap, 0, 0);
+    if (typeof OffscreenCanvas.prototype.convertToBlob !== "function") {
+      throw new ImageProcessingError(
+        "WORKER_UNSUPPORTED",
+        "Worker PNG encoding is not available in this webview.",
+      );
+    }
+
+    validateDimensions(bitmap, request.dimensions);
+    const width = bitmap.width;
+    const height = bitmap.height;
+    const canvas = new OffscreenCanvas(width, height);
+    const context = getContext(canvas);
+    context.drawImage(bitmap, 0, 0);
     bitmap.close();
     bitmapIsOpen = false;
 
-    const sourcePixels = sourceContext.getImageData(
-      0,
-      0,
-      sourceCanvas.width,
-      sourceCanvas.height,
-    ) as PixelBuffer;
-    sourceCanvas.width = 1;
-    sourceCanvas.height = 1;
+    const source = context.getImageData(0, 0, width, height) as PixelBuffer;
+    const removal = removeEdgeConnectedBackground(source);
 
-    const result = reconstructSourceCells(
-      sourcePixels,
-      request.options.xRanges,
-      request.options.yRanges,
-      {
-        current: request.options.current,
-        protectedMask: request.options.protectedMask,
-        palette: request.options.palette,
-        crop: request.options.crop,
-        includeDecisions: false,
-      },
-    );
-    let changedPixels = 0;
-
-    for (
-      let index = 0;
-      index < request.options.current.width * request.options.current.height;
-      index += 1
-    ) {
-      const offset = index * 4;
-      if (
-        result.data[offset] !== request.options.current.data[offset] ||
-        result.data[offset + 1] !==
-          request.options.current.data[offset + 1] ||
-        result.data[offset + 2] !==
-          request.options.current.data[offset + 2] ||
-        result.data[offset + 3] !== request.options.current.data[offset + 3]
-      ) {
-        changedPixels += 1;
-      }
+    if (removal.removedPixels > 0) {
+      context.putImageData(
+        new ImageData(removal.image.data, width, height),
+        0,
+        0,
+      );
     }
 
+    const blob =
+      removal.removedPixels > 0
+        ? await canvas.convertToBlob({ type: "image/png" })
+        : null;
     return {
-      width: result.width,
-      height: result.height,
-      data: result.data,
-      changedPixels,
+      blob,
+      width,
+      height,
+      detected: removal.detected,
+      removedPixels: removal.removedPixels,
+      noOpaquePixels: removal.noOpaquePixels,
     };
   } finally {
     if (bitmapIsOpen) bitmap.close();
@@ -308,7 +306,7 @@ workerScope.onmessage = (event) => {
           result,
         });
       } else {
-        const result = await reconstruct(request);
+        const result = await removeBackground(request);
         workerScope.postMessage({
           id: request.id,
           operation: request.operation,

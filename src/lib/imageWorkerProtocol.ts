@@ -1,14 +1,10 @@
 import type {
   PixelGridDetection,
+  PixelGridPhaseAlignment,
   PixelGridSettings,
   PixelGridSuggestion,
-  PixelBuffer,
 } from "./gridDetection";
 import type { CellRange } from "./pixelizeCore";
-import type {
-  ReconstructionCrop,
-  ReconstructionPaletteColor,
-} from "./cellReconstruction";
 
 export type SourceDimensions = {
   expectedWidth: number;
@@ -17,6 +13,7 @@ export type SourceDimensions = {
 
 export type AnalyzeImageOptions = SourceDimensions & {
   maximumColors?: number;
+  phasePixelSizes?: number[];
 };
 
 export type AnalyzeImageResult = {
@@ -24,6 +21,7 @@ export type AnalyzeImageResult = {
   sourceHeight: number;
   detection: PixelGridDetection;
   suggestion: PixelGridSuggestion | null;
+  phaseAlignments: PixelGridPhaseAlignment[];
   palette: string[];
 };
 
@@ -35,17 +33,13 @@ export type PixelizeImageResult = {
   yRanges: CellRange[];
 };
 
-export type ReconstructImageOptions = SourceDimensions & {
-  current: PixelBuffer;
-  xRanges: CellRange[];
-  yRanges: CellRange[];
-  crop: ReconstructionCrop;
-  protectedMask?: Uint8Array;
-  palette?: ReconstructionPaletteColor[];
-};
-
-export type ReconstructImageResult = PixelBuffer & {
-  changedPixels: number;
+export type RemoveBackgroundImageResult = {
+  blob: Blob | null;
+  width: number;
+  height: number;
+  detected: boolean;
+  removedPixels: number;
+  noOpaquePixels: boolean;
 };
 
 export type ImageWorkerErrorCode =
@@ -69,22 +63,22 @@ export type PixelizeImageRequest = {
   dimensions: SourceDimensions;
 };
 
-export type ReconstructImageRequest = {
+export type RemoveBackgroundImageRequest = {
   id: number;
-  operation: "reconstruct";
+  operation: "removeBackground";
   file: File;
-  options: ReconstructImageOptions;
+  dimensions: SourceDimensions;
 };
 
 export type ImageWorkerRequest =
   | AnalyzeImageRequest
   | PixelizeImageRequest
-  | ReconstructImageRequest;
+  | RemoveBackgroundImageRequest;
 
 export type ImageWorkerRequestPayload =
   | Omit<AnalyzeImageRequest, "id">
   | Omit<PixelizeImageRequest, "id">
-  | Omit<ReconstructImageRequest, "id">;
+  | Omit<RemoveBackgroundImageRequest, "id">;
 
 export type ImageWorkerSuccess =
   | {
@@ -101,9 +95,9 @@ export type ImageWorkerSuccess =
     }
   | {
       id: number;
-      operation: "reconstruct";
+      operation: "removeBackground";
       ok: true;
-      result: ReconstructImageResult;
+      result: RemoveBackgroundImageResult;
     };
 
 export type ImageWorkerFailure = {

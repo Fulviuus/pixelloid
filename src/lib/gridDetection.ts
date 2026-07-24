@@ -5,16 +5,27 @@ export type PixelGridDetection = {
   offsetY: number;
 };
 
+export type PixelSamplingMode = "nearest" | "medoid";
+
 export type PixelGridSettings = {
   pixelSize: number;
   offsetX: number;
   offsetY: number;
+  samplingMode?: PixelSamplingMode;
+  /** Match a conventional whole-canvas nearest-neighbor resize. */
+  fitToCanvas?: boolean;
 };
 
 export type PixelGridSuggestion = {
   pixelSize: number;
   confidence: number;
   alternatives: number[];
+};
+
+export type PixelGridPhaseAlignment = {
+  pixelSize: number;
+  offsetX: number | null;
+  offsetY: number | null;
 };
 
 export type PixelBuffer = {
@@ -912,6 +923,133 @@ function normalizedSourceOffset(offset: number, pitch: number, scale: number) {
   return Math.round(sourceOffset * 1000) / 1000;
 }
 
+/**
+ * Re-score the phase of a known pitch against visible foreground only.
+ *
+ * This is used after background removal, when pitch detection can become less
+ * confident because most of the canvas is transparent. The pitch stays under
+ * user control while its X/Y boundaries are realigned to the surviving art.
+ */
+export function alignPixelGridPhaseData(
+  image: PixelBuffer,
+  pixelSize: number,
+  sourceWidth = image.width,
+  sourceHeight = image.height,
+): PixelGridPhaseAlignment | null {
+  if (
+    !Number.isFinite(pixelSize) ||
+    pixelSize <= 1 ||
+    !Number.isFinite(sourceWidth) ||
+    !Number.isFinite(sourceHeight) ||
+    sourceWidth < 1 ||
+    sourceHeight < 1
+  ) {
+    return null;
+  }
+
+  // Once the background is transparent, the foreground extent is a stronger
+  // phase reference than noisy antialiased edges. Center an integer number of
+  // logical samples across that extent. This is equivalent to tightly padding
+  // the sprite before nearest-neighbor reduction while retaining the app's
+  // full-canvas output dimensions.
+  let foregroundLeft = image.width;
+  let foregroundTop = image.height;
+  let foregroundRight = -1;
+  let foregroundBottom = -1;
+  let foregroundPixels = 0;
+  let transparentPixels = 0;
+
+  for (let y = 0; y < image.height; y += 1) {
+    for (let x = 0; x < image.width; x += 1) {
+      const alpha = image.data[(y * image.width + x) * 4 + 3];
+
+      if (alpha < 128) {
+        transparentPixels += 1;
+        continue;
+      }
+
+      foregroundPixels += 1;
+      foregroundLeft = Math.min(foregroundLeft, x);
+      foregroundTop = Math.min(foregroundTop, y);
+      foregroundRight = Math.max(foregroundRight, x);
+      foregroundBottom = Math.max(foregroundBottom, y);
+    }
+  }
+
+  if (transparentPixels > 0 && foregroundPixels > 0) {
+    const scaleX = image.width / sourceWidth;
+    const scaleY = image.height / sourceHeight;
+
+    function centeredForegroundOffset(
+      start: number,
+      end: number,
+      scale: number,
+    ) {
+      const sourceStart = start / scale;
+      const sourceEnd = end / scale;
+      const sourceSpan = sourceEnd - sourceStart + 1 / scale;
+      const logicalCells = Math.max(1, Math.round(sourceSpan / pixelSize));
+      const fittedSpan = logicalCells * pixelSize;
+
+      // Exact rectangular fixtures already expose their true first boundary.
+      // Irregular AI-generated silhouettes need their sample centers balanced
+      // around the inclusive foreground bounds instead.
+      const firstBoundary =
+        Math.abs(sourceSpan - fittedSpan) <= 0.1
+          ? sourceStart
+          : (sourceStart + sourceEnd) / 2 - fittedSpan / 2;
+
+      return (
+        Math.round(
+          positiveModulo(Math.floor(firstBoundary + EPSILON), pixelSize) *
+            1000,
+        ) / 1000
+      );
+    }
+
+    return {
+      pixelSize,
+      offsetX: centeredForegroundOffset(
+        foregroundLeft,
+        foregroundRight,
+        scaleX,
+      ),
+      offsetY: centeredForegroundOffset(
+        foregroundTop,
+        foregroundBottom,
+        scaleY,
+      ),
+    };
+  }
+
+  const region = findAnalysisRegion(image);
+  if (region.foregroundMask === null) return null;
+
+  const scaleX = image.width / sourceWidth;
+  const scaleY = image.height / sourceHeight;
+  const xScore = scoreAxisPitch(
+    verticalEnergy(image, region),
+    pixelSize * scaleX,
+    region.anchorX,
+  );
+  const yScore = scoreAxisPitch(
+    horizontalEnergy(image, region),
+    pixelSize * scaleY,
+    region.anchorY,
+  );
+  const offsetX =
+    xScore.alignment >= MIN_AXIS_ALIGNMENT
+      ? normalizedSourceOffset(xScore.offset, pixelSize, scaleX)
+      : null;
+  const offsetY =
+    yScore.alignment >= MIN_AXIS_ALIGNMENT
+      ? normalizedSourceOffset(yScore.offset, pixelSize, scaleY)
+      : null;
+
+  if (offsetX === null && offsetY === null) return null;
+  return { pixelSize, offsetX, offsetY };
+}
+
 export function buildCellRanges(
   length: number,
   pixelSize: number,
@@ -921,10 +1059,10 @@ export function buildCellRanges(
     Number.isFinite(pixelSize) && pixelSize > 0 ? Math.max(1, pixelSize) : 1;
   const safeOffset = Number.isFinite(offset) ? offset : 0;
   const normalizedOffset = positiveModulo(safeOffset, period);
-  const minimumFragment = period * 0.5;
   const ranges: Array<[number, number]> = [];
+  const targetCount = Math.max(1, Math.round(length / period));
 
-  if (normalizedOffset + EPSILON >= minimumFragment) {
+  if (normalizedOffset > EPSILON) {
     const fragmentEnd = Math.min(length, Math.round(normalizedOffset));
     if (fragmentEnd > 0) ranges.push([0, fragmentEnd]);
   }
@@ -940,11 +1078,21 @@ export function buildCellRanges(
       length,
       normalizedOffset + (index + 1) * period,
     );
-    if (logicalEnd - logicalStart + EPSILON < minimumFragment) continue;
-
     const start = Math.max(0, Math.min(length, Math.round(logicalStart)));
     const end = Math.max(start, Math.min(length, Math.round(logicalEnd)));
     if (end > start) ranges.push([start, end]);
+  }
+
+  // Phase changes where cells land, not the chosen logical resolution. When
+  // both canvas edges contain partial cells, discard only the shorter edge
+  // fragment until the stable round(length / pitch) count is reached.
+  while (ranges.length > targetCount) {
+    const first = ranges[0];
+    const last = ranges[ranges.length - 1];
+    const firstLength = first[1] - first[0];
+    const lastLength = last[1] - last[0];
+    if (firstLength <= lastLength) ranges.shift();
+    else ranges.pop();
   }
 
   if (ranges.length === 0) ranges.push([0, length]);
@@ -975,24 +1123,6 @@ export function detectPixelGridData(
   const region = findAnalysisRegion(image);
   const xEnergy = verticalEnergy(image, region);
   const yEnergy = horizontalEnergy(image, region);
-  const fullCanvasRegion: AnalysisRegion | null = region.hasLightNeutralCanvas
-    ? {
-        left: 0,
-        top: 0,
-        right: image.width,
-        bottom: image.height,
-        foregroundMask: null,
-        anchorX: 0,
-        anchorY: 0,
-        hasLightNeutralCanvas: false,
-      }
-    : null;
-  const canvasXEnergy = fullCanvasRegion
-    ? verticalEnergy(image, fullCanvasRegion)
-    : null;
-  const canvasYEnergy = fullCanvasRegion
-    ? horizontalEnergy(image, fullCanvasRegion)
-    : null;
   const candidates = candidatePitches(
     xEnergy,
     yEnergy,
@@ -1084,26 +1214,11 @@ export function detectPixelGridData(
   }
   pixelSize = Math.max(1, Math.round(pixelSize * 1000) / 1000);
 
-  let detectedOffsetX = best.offsetX;
-  let detectedOffsetY = best.offsetY;
-
-  // A light canvas may itself contain a subtle checker/grid (the real 1254px
-  // fixture does). Use that full-canvas signal only to recover phase; pitch is
-  // still chosen from foreground structure, so a plain shifted white sprite
-  // cannot be pulled toward canvasWidth / N again.
-  if (canvasXEnergy && canvasYEnergy) {
-    const canvasX = scoreAxisPitch(canvasXEnergy, best.pitch, 0);
-    const canvasY = scoreAxisPitch(canvasYEnergy, best.pitch, 0);
-    if (canvasX.alignment >= MIN_AXIS_ALIGNMENT) {
-      detectedOffsetX = canvasX.offset;
-    }
-    if (canvasY.alignment >= MIN_AXIS_ALIGNMENT) {
-      detectedOffsetY = canvasY.offset;
-    }
-  }
-
-  const offsetX = normalizedSourceOffset(detectedOffsetX, pixelSize, scaleX);
-  const offsetY = normalizedSourceOffset(detectedOffsetY, pixelSize, scaleY);
+  // Phase comes from the masked art region above. A checkerboard or another
+  // periodic canvas texture is not evidence for where the sprite's logical
+  // pixel boundaries begin.
+  const offsetX = normalizedSourceOffset(best.offsetX, pixelSize, scaleX);
+  const offsetY = normalizedSourceOffset(best.offsetY, pixelSize, scaleY);
   return {
     pixelSize,
     confidence: confidenceFromFinalScores(best, runnerUp),

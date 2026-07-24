@@ -1,10 +1,12 @@
 import {
+  alignPixelGridPhaseData,
   analyzePixelGridData,
   buildCellRanges,
   detectPixelGridData,
   getPixelGridDimensions,
   suggestPixelGridData,
   type PixelGridDetection,
+  type PixelGridPhaseAlignment,
   type PixelGridSettings,
   type PixelGridSuggestion,
 } from "./gridDetection";
@@ -12,10 +14,13 @@ import { pixelizeBuffer } from "./pixelizeCore";
 
 export type {
   PixelGridDetection,
+  PixelGridPhaseAlignment,
   PixelGridSettings,
   PixelGridSuggestion,
+  PixelSamplingMode,
 } from "./gridDetection";
 export {
+  alignPixelGridPhaseData,
   analyzePixelGridData,
   buildCellRanges,
   detectPixelGridData,
@@ -34,8 +39,6 @@ export type PixelizeResult = {
   width: number;
   height: number;
   sourceGrid?: SourceGridMapping;
-  /** Logical pixels manually changed in the editor and protected from repair. */
-  protectedMask?: Uint8Array;
   crop?: {
     x: number;
     y: number;
@@ -116,6 +119,29 @@ export function analyzePixelGrid(image: CanvasImageSource): {
     analysis.sourceWidth,
     analysis.sourceHeight,
   );
+}
+
+export function alignPixelGridPhases(
+  image: CanvasImageSource,
+  pixelSizes: number[],
+): PixelGridPhaseAlignment[] {
+  if (pixelSizes.length === 0) return [];
+  const analysis = rasterizeGridAnalysis(image);
+
+  return pixelSizes
+    .slice(0, 3)
+    .map((pixelSize) =>
+      alignPixelGridPhaseData(
+        analysis.image,
+        pixelSize,
+        analysis.sourceWidth,
+        analysis.sourceHeight,
+      ),
+    )
+    .filter(
+      (alignment): alignment is PixelGridPhaseAlignment =>
+        alignment !== null,
+    );
 }
 
 /** Rebuild the image with one output pixel per inferred source block. */

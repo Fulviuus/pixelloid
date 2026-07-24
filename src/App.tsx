@@ -11,19 +11,26 @@ import {
   ArrowRight,
   Check,
   Download,
+  ImageOff,
   ImagePlus,
   Minus,
   Pencil,
   Plus,
   RotateCcw,
   ScanSearch,
+  Settings,
   Sparkles,
   Upload,
   WandSparkles,
 } from "lucide-react";
 import pixelloidWordmark from "./assets/pixelloid-wordmark-dark.png";
+import pixelloidWordmarkLight from "./assets/pixelloid-wordmark.png";
 import { PixelEditor } from "./components/PixelEditor";
 import { PixelMark } from "./components/PixelMark";
+import {
+  SettingsDialog,
+  type AppTheme,
+} from "./components/SettingsDialog";
 import {
   getImageWorkerClient,
   isAbortError,
@@ -31,22 +38,33 @@ import {
   shouldFallbackFromImageWorker,
 } from "./lib/imageWorkerClient";
 import {
+  alignPixelGridPhases,
   analyzePixelGrid,
   getPixelGridDimensions,
   pixelizeImage,
   PixelizeResult,
+  type PixelGridPhaseAlignment,
   type PixelGridSuggestion,
+  type PixelSamplingMode,
 } from "./lib/pixelize";
+import {
+  getPixelGridAmbiguity,
+  type PixelGridAmbiguity,
+  type PixelGridCandidate,
+} from "./lib/gridAmbiguity";
 import { extractImagePalette } from "./lib/palette";
+import { removeEdgeConnectedBackground } from "./lib/backgroundRemoval";
 import "./App.css";
 
 type SourceImage = {
   file: File;
+  originalProcessingFile: File;
   processingFile: File;
   image: HTMLImageElement;
   url: string;
   width: number;
   height: number;
+  backgroundRemoved: boolean;
 };
 
 type DetectedGridSetting = {
@@ -76,9 +94,34 @@ const ACCEPTED_IMAGE_EXTENSIONS = new Set([
   "bmp",
 ]);
 const MAX_SOURCE_PIXELS = 40_000_000;
+const MAX_BACKGROUND_REMOVAL_PIXELS = 2048 * 2048;
 const MIN_USABLE_DETECTION_CONFIDENCE = 20;
 const GRID_VALUE_PRECISION = 1000;
 const GRID_VALUE_EPSILON = 1 / GRID_VALUE_PRECISION;
+const THEME_STORAGE_KEY = "pixelloid.theme";
+const CHROMA_KEY_STORAGE_KEY = "pixelloid.chroma-key";
+const DEFAULT_CHROMA_KEY = "#ff00ff";
+
+function storedTheme(): AppTheme {
+  try {
+    return localStorage.getItem(THEME_STORAGE_KEY) === "light"
+      ? "light"
+      : "dark";
+  } catch {
+    return "dark";
+  }
+}
+
+function storedChromaKey() {
+  try {
+    const stored = localStorage.getItem(CHROMA_KEY_STORAGE_KEY);
+    return stored && /^#[0-9a-f]{6}$/i.test(stored)
+      ? stored.toLowerCase()
+      : DEFAULT_CHROMA_KEY;
+  } catch {
+    return DEFAULT_CHROMA_KEY;
+  }
+}
 
 function fileExtension(file: File) {
   return file.name.split(".").pop()?.toLowerCase() ?? "";
@@ -170,6 +213,55 @@ async function freezeGifFrame(
   });
 }
 
+async function decodePreview(file: File) {
+  const url = URL.createObjectURL(file);
+  const image = new Image();
+  image.decoding = "async";
+  image.src = url;
+
+  try {
+    await image.decode();
+    return { image, url };
+  } catch (error) {
+    URL.revokeObjectURL(url);
+    throw error;
+  }
+}
+
+async function removeBackgroundOnMainThread(image: HTMLImageElement) {
+  const width = image.naturalWidth;
+  const height = image.naturalHeight;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+
+  if (!context) {
+    throw new Error("Canvas is not available on this system.");
+  }
+
+  context.drawImage(image, 0, 0);
+  const removal = removeEdgeConnectedBackground(
+    context.getImageData(0, 0, width, height),
+  );
+
+  if (removal.removedPixels > 0) {
+    context.putImageData(
+      new ImageData(removal.image.data, width, height),
+      0,
+      0,
+    );
+  }
+
+  return {
+    ...removal,
+    blob:
+      removal.removedPixels > 0 ? await htmlCanvasToPng(canvas) : null,
+    width,
+    height,
+  };
+}
+
 function formatPixelSize(value: number) {
   return Number.isInteger(value)
     ? String(value)
@@ -198,6 +290,7 @@ function prepareDetectedGrid(
     confidence: number | null;
   };
   detected: DetectedGridSetting | null;
+  ambiguity: PixelGridAmbiguity | null;
 } {
   const valuesAreFinite =
     Number.isFinite(detection.pixelSize) &&
@@ -213,6 +306,7 @@ function prepareDetectedGrid(
     return {
       active: { pixelSize: 1, offsetX: 0, offsetY: 0, confidence: null },
       detected: null,
+      ambiguity: null,
     };
   }
 
@@ -228,6 +322,7 @@ function prepareDetectedGrid(
     return {
       active: { pixelSize, offsetX: 0, offsetY: 0, confidence: null },
       detected: null,
+      ambiguity: null,
     };
   }
 
@@ -237,8 +332,23 @@ function prepareDetectedGrid(
     offsetY: roundGridValue(detection.offsetY),
     confidence: Math.round(Math.max(0, Math.min(100, detection.confidence))),
   };
+  const ambiguity = getPixelGridAmbiguity(detected, width, height);
 
-  return { active: detected, detected };
+  if (ambiguity) {
+    const recommended = ambiguity.candidates[0];
+    return {
+      active: {
+        pixelSize: recommended.pixelSize,
+        offsetX: recommended.offsetX,
+        offsetY: recommended.offsetY,
+        confidence: null,
+      },
+      detected,
+      ambiguity,
+    };
+  }
+
+  return { active: detected, detected, ambiguity: null };
 }
 
 function prepareGridSuggestion(
@@ -288,6 +398,7 @@ function App() {
   const workerFallbackFileRef = useRef<File | null>(null);
   const sourceRef = useRef<SourceImage | null>(null);
   const resultRef = useRef<PixelizeResult | null>(null);
+  const ambiguityPreviewGenerationRef = useRef(0);
   const suggestionPrimaryActionRef = useRef<HTMLButtonElement | null>(null);
   const suggestionFollowupActionRef = useRef<HTMLButtonElement | null>(null);
   const suggestionFocusRequestRef = useRef(false);
@@ -300,29 +411,55 @@ function App() {
     useState<DetectedGridSetting | null>(null);
   const [gridSuggestion, setGridSuggestion] =
     useState<PixelGridSuggestion | null>(null);
+  const [gridAmbiguity, setGridAmbiguity] =
+    useState<PixelGridAmbiguity | null>(null);
+  const [ambiguityPreviewUrls, setAmbiguityPreviewUrls] = useState<
+    Partial<Record<PixelGridCandidate["kind"], string>>
+  >({});
+  const [ambiguityPreviewStatus, setAmbiguityPreviewStatus] = useState<
+    "idle" | "loading" | "ready" | "failed"
+  >("idle");
   const [suggestionDecision, setSuggestionDecision] =
     useState<SuggestionDecision | null>(null);
   const [acceptedSuggestionPixelSize, setAcceptedSuggestionPixelSize] =
     useState<number | null>(null);
   const [strictDetectionFailed, setStrictDetectionFailed] = useState(false);
+  const [samplingMode, setSamplingMode] =
+    useState<PixelSamplingMode>("nearest");
   const [isDragging, setIsDragging] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isRemovingBackground, setIsRemovingBackground] = useState(false);
   const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [sourcePalette, setSourcePalette] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [theme, setTheme] = useState<AppTheme>(storedTheme);
+  const [chromaKey, setChromaKey] = useState(storedChromaKey);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const shortcutHandlerRef = useRef<(event: globalThis.KeyboardEvent) => void>(
     () => undefined,
   );
 
   shortcutHandlerRef.current = (event) => {
-    if (isEditorOpen) return;
+    if (isEditorOpen || isSettingsOpen) return;
 
     if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
       event.preventDefault();
       void handlePixelize();
     }
   };
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.setProperty("--chroma-key", chromaKey);
+
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
+      localStorage.setItem(CHROMA_KEY_STORAGE_KEY, chromaKey);
+    } catch {
+      // The settings still apply for this session when storage is unavailable.
+    }
+  }, [chromaKey, theme]);
 
   const outputSize = useMemo(() => {
     if (!source) return null;
@@ -387,11 +524,112 @@ function App() {
     return () => {
       loadGenerationRef.current += 1;
       conversionGenerationRef.current += 1;
+      ambiguityPreviewGenerationRef.current += 1;
       resetImageWorkerClient("Pixelloid was closed.");
       if (sourceRef.current) URL.revokeObjectURL(sourceRef.current.url);
       if (resultRef.current) URL.revokeObjectURL(resultRef.current.url);
     };
   }, []);
+
+  useEffect(() => {
+    const generation = ++ambiguityPreviewGenerationRef.current;
+    const createdUrls: string[] = [];
+    setAmbiguityPreviewUrls({});
+
+    if (!source || !gridAmbiguity) {
+      setAmbiguityPreviewStatus("idle");
+      return;
+    }
+    setAmbiguityPreviewStatus("loading");
+    const previewSource = source;
+    const previewAmbiguity = gridAmbiguity;
+
+    async function buildPreviews() {
+      const previews: Partial<
+        Record<PixelGridCandidate["kind"], string>
+      > = {};
+      let worker =
+        workerFallbackFileRef.current === previewSource.processingFile
+          ? null
+          : getImageWorkerClient();
+
+      for (const candidate of previewAmbiguity.candidates) {
+        const settings = {
+          pixelSize: candidate.pixelSize,
+          offsetX: candidate.offsetX,
+          offsetY: candidate.offsetY,
+          samplingMode,
+          fitToCanvas:
+            samplingMode === "nearest" &&
+            !previewSource.backgroundRemoved,
+        };
+        let url: string;
+
+        if (worker) {
+          try {
+            const generated = await worker.pixelize(
+              previewSource.processingFile,
+              settings,
+              {
+                expectedWidth: previewSource.width,
+                expectedHeight: previewSource.height,
+              },
+            );
+            url = URL.createObjectURL(generated.blob);
+          } catch (workerError) {
+            if (
+              isAbortError(workerError) ||
+              !shouldFallbackFromImageWorker(workerError)
+            ) {
+              throw workerError;
+            }
+
+            workerFallbackFileRef.current = previewSource.processingFile;
+            worker = null;
+            const generated = await pixelizeImage(
+              previewSource.image,
+              settings,
+            );
+            url = generated.url;
+          }
+        } else {
+          const generated = await pixelizeImage(previewSource.image, settings);
+          url = generated.url;
+        }
+
+        if (generation !== ambiguityPreviewGenerationRef.current) {
+          URL.revokeObjectURL(url);
+          return;
+        }
+
+        createdUrls.push(url);
+        previews[candidate.kind] = url;
+      }
+
+      if (generation === ambiguityPreviewGenerationRef.current) {
+        setAmbiguityPreviewUrls(previews);
+        setAmbiguityPreviewStatus("ready");
+      }
+    }
+
+    void buildPreviews().catch((previewError) => {
+      createdUrls.splice(0).forEach((url) => URL.revokeObjectURL(url));
+      if (
+        generation === ambiguityPreviewGenerationRef.current &&
+        !isAbortError(previewError)
+      ) {
+        setAmbiguityPreviewUrls({});
+        setAmbiguityPreviewStatus("failed");
+      }
+    });
+
+    return () => {
+      if (generation === ambiguityPreviewGenerationRef.current) {
+        ambiguityPreviewGenerationRef.current += 1;
+      }
+      createdUrls.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, [gridAmbiguity, samplingMode, source]);
 
   useEffect(() => {
     function preventWindowFileDrop(event: globalThis.DragEvent) {
@@ -430,6 +668,167 @@ function App() {
     nextTarget?.focus();
   }, [suggestionDecision]);
 
+  async function analyzePreparedSource(
+    processingFile: File,
+    image: HTMLImageElement,
+    width: number,
+    height: number,
+    phasePixelSizes: number[] = [],
+  ) {
+    let detection: ReturnType<typeof analyzePixelGrid>["detection"];
+    let suggestion: PixelGridSuggestion | null;
+    let phaseAlignments: PixelGridPhaseAlignment[];
+    let palette: string[];
+    const worker =
+      workerFallbackFileRef.current === processingFile
+        ? null
+        : getImageWorkerClient();
+
+    if (worker) {
+      try {
+        const analysis = await worker.analyze(processingFile, {
+          expectedWidth: width,
+          expectedHeight: height,
+          maximumColors: 24,
+          phasePixelSizes,
+        });
+        detection = analysis.detection;
+        suggestion = analysis.suggestion;
+        phaseAlignments = analysis.phaseAlignments;
+        palette = analysis.palette;
+      } catch (workerError) {
+        if (
+          isAbortError(workerError) ||
+          !shouldFallbackFromImageWorker(workerError)
+        ) {
+          throw workerError;
+        }
+
+        workerFallbackFileRef.current = processingFile;
+        const analysis = analyzePixelGrid(image);
+        detection = analysis.detection;
+        suggestion = analysis.suggestion;
+        phaseAlignments = alignPixelGridPhases(image, phasePixelSizes);
+        palette = extractImagePalette(image);
+      }
+    } else {
+      const analysis = analyzePixelGrid(image);
+      detection = analysis.detection;
+      suggestion = analysis.suggestion;
+      phaseAlignments = alignPixelGridPhases(image, phasePixelSizes);
+      palette = extractImagePalette(image);
+    }
+
+    const preparedGrid = prepareDetectedGrid(detection, width, height);
+    const preparedSuggestion =
+      preparedGrid.detected === null
+        ? prepareGridSuggestion(suggestion, width, height)
+        : null;
+
+    return {
+      palette,
+      phaseAlignments,
+      preparedGrid,
+      preparedSuggestion,
+    };
+  }
+
+  function commitAnalyzedSource(
+    loaded: SourceImage,
+    analysis: Awaited<ReturnType<typeof analyzePreparedSource>>,
+    options: { preserveExistingGridWhenUndetected?: boolean } = {},
+  ) {
+    replaceSource(loaded);
+    setSourcePalette(analysis.palette);
+
+    const existingGridIsMeaningful =
+      detectedGrid !== null ||
+      confidence !== null ||
+      pixelSize > 1 + GRID_VALUE_EPSILON ||
+      Math.abs(gridOffset.x) >= GRID_VALUE_EPSILON ||
+      Math.abs(gridOffset.y) >= GRID_VALUE_EPSILON;
+    if (
+      options.preserveExistingGridWhenUndetected &&
+      analysis.preparedGrid.detected === null &&
+      existingGridIsMeaningful
+    ) {
+      // Background removal does not move pixels, so the active geometry remains
+      // a useful conversion setting. Do not keep the old detector metadata,
+      // though: its confidence may have come from the background just removed.
+      setConfidence(null);
+      setDetectedGrid(null);
+      const activeAlignment = analysis.phaseAlignments.find(
+        (alignment) =>
+          Math.abs(alignment.pixelSize - pixelSize) <
+          GRID_VALUE_EPSILON,
+      );
+      if (activeAlignment) {
+        setGridOffset((current) => ({
+          x: activeAlignment.offsetX ?? current.x,
+          y: activeAlignment.offsetY ?? current.y,
+        }));
+      }
+      setGridAmbiguity((current) => {
+        if (!current) return current;
+        if (analysis.phaseAlignments.length === 0) {
+          return { ...current, confidence: null };
+        }
+
+        const candidates = current.candidates.map((candidate) => {
+          const alignment = analysis.phaseAlignments.find(
+            (item) =>
+              Math.abs(item.pixelSize - candidate.pixelSize) <
+              GRID_VALUE_EPSILON,
+          );
+          if (!alignment) return candidate;
+          const offsetX = alignment.offsetX ?? candidate.offsetX;
+          const offsetY = alignment.offsetY ?? candidate.offsetY;
+          const dimensions = getPixelGridDimensions(
+            loaded.width,
+            loaded.height,
+            {
+              pixelSize: candidate.pixelSize,
+              offsetX,
+              offsetY,
+            },
+          );
+
+          return {
+            ...candidate,
+            offsetX,
+            offsetY,
+            width: dimensions.width,
+            height: dimensions.height,
+          };
+        }) as PixelGridAmbiguity["candidates"];
+
+        return { confidence: null, candidates };
+      });
+      setGridSuggestion(analysis.preparedSuggestion);
+      setSuggestionDecision(
+        analysis.preparedSuggestion ? "available" : null,
+      );
+      setAcceptedSuggestionPixelSize(null);
+      setStrictDetectionFailed(true);
+      return;
+    }
+
+    setPixelSize(analysis.preparedGrid.active.pixelSize);
+    setGridOffset({
+      x: analysis.preparedGrid.active.offsetX,
+      y: analysis.preparedGrid.active.offsetY,
+    });
+    setConfidence(analysis.preparedGrid.active.confidence);
+    setDetectedGrid(analysis.preparedGrid.detected);
+    setGridAmbiguity(analysis.preparedGrid.ambiguity);
+    setGridSuggestion(analysis.preparedSuggestion);
+    setSuggestionDecision(
+      analysis.preparedSuggestion ? "available" : null,
+    );
+    setAcceptedSuggestionPixelSize(null);
+    setStrictDetectionFailed(analysis.preparedGrid.detected === null);
+  }
+
   async function loadFile(file: File) {
     if (!isAcceptedImageFile(file)) {
       setError("Choose a PNG, JPG, WebP, GIF, AVIF, or BMP image.");
@@ -444,6 +843,7 @@ function App() {
     setError(null);
     setIsAnalyzing(true);
     setIsProcessing(false);
+    setIsRemovingBackground(false);
     setIsEditorOpen(false);
     setSourcePalette([]);
     replaceResult(null);
@@ -505,75 +905,27 @@ function App() {
 
       const loaded: SourceImage = {
         file,
+        originalProcessingFile: processingFile,
         processingFile,
         image,
         url: activeUrl,
         width: image.naturalWidth,
         height: image.naturalHeight,
+        backgroundRemoved: false,
       };
-      let detection: ReturnType<typeof analyzePixelGrid>["detection"];
-      let suggestion: PixelGridSuggestion | null;
-      let palette: string[];
-      const worker = getImageWorkerClient();
-
-      if (worker) {
-        try {
-          const analysis = await worker.analyze(processingFile, {
-            expectedWidth: loaded.width,
-            expectedHeight: loaded.height,
-            maximumColors: 24,
-          });
-          detection = analysis.detection;
-          suggestion = analysis.suggestion;
-          palette = analysis.palette;
-        } catch (workerError) {
-          if (
-            isAbortError(workerError) ||
-            !shouldFallbackFromImageWorker(workerError)
-          ) {
-            throw workerError;
-          }
-
-          workerFallbackFileRef.current = processingFile;
-          const analysis = analyzePixelGrid(image);
-          detection = analysis.detection;
-          suggestion = analysis.suggestion;
-          palette = extractImagePalette(image);
-        }
-      } else {
-        const analysis = analyzePixelGrid(image);
-        detection = analysis.detection;
-        suggestion = analysis.suggestion;
-        palette = extractImagePalette(image);
-      }
-      const preparedGrid = prepareDetectedGrid(
-        detection,
+      const analysis = await analyzePreparedSource(
+        processingFile,
+        image,
         loaded.width,
         loaded.height,
       );
-      const preparedSuggestion =
-        preparedGrid.detected === null
-          ? prepareGridSuggestion(suggestion, loaded.width, loaded.height)
-          : null;
 
       if (generation !== loadGenerationRef.current) {
         revokePendingSourceUrls();
         return;
       }
 
-      replaceSource(loaded);
-      setPixelSize(preparedGrid.active.pixelSize);
-      setGridOffset({
-        x: preparedGrid.active.offsetX,
-        y: preparedGrid.active.offsetY,
-      });
-      setConfidence(preparedGrid.active.confidence);
-      setDetectedGrid(preparedGrid.detected);
-      setGridSuggestion(preparedSuggestion);
-      setSuggestionDecision(preparedSuggestion ? "available" : null);
-      setAcceptedSuggestionPixelSize(null);
-      setStrictDetectionFailed(preparedGrid.detected === null);
-      setSourcePalette(palette);
+      commitAnalyzedSource(loaded, analysis);
     } catch (caughtError) {
       revokePendingSourceUrls();
 
@@ -621,7 +973,10 @@ function App() {
 
   function updatePixelSize(
     nextSize: number,
-    options: { forceManual?: boolean } = {},
+    options: {
+      forceManual?: boolean;
+      offset?: { x: number; y: number };
+    } = {},
   ) {
     if (!source) return;
     const maximum = maximumPixelSize(source.width, source.height);
@@ -632,9 +987,11 @@ function App() {
       !options.forceManual &&
       detectedGrid !== null &&
       Math.abs(clampedSize - detectedGrid.pixelSize) < GRID_VALUE_EPSILON;
-    const nextOffset = restoresDetection
-      ? { x: detectedGrid.offsetX, y: detectedGrid.offsetY }
-      : { x: 0, y: 0 };
+    const nextOffset =
+      options.offset ??
+      (restoresDetection
+        ? { x: detectedGrid.offsetX, y: detectedGrid.offsetY }
+        : { x: 0, y: 0 });
     const nextConfidence = restoresDetection
       ? detectedGrid.confidence
       : null;
@@ -649,7 +1006,6 @@ function App() {
     }
 
     conversionGenerationRef.current += 1;
-    resetImageWorkerClient("Pixel-grid settings changed.");
     setIsProcessing(false);
     setPixelSize(clampedSize);
     setGridOffset(nextOffset);
@@ -713,6 +1069,196 @@ function App() {
     setSuggestionDecision("available");
   }
 
+  function selectAmbiguousGrid(candidate: PixelGridCandidate) {
+    updatePixelSize(candidate.pixelSize, {
+      forceManual: candidate.kind !== "detected",
+      offset: { x: candidate.offsetX, y: candidate.offsetY },
+    });
+  }
+
+  function updateSamplingMode(nextMode: PixelSamplingMode) {
+    if (nextMode === samplingMode) return;
+
+    conversionGenerationRef.current += 1;
+    resetImageWorkerClient("Pixel sampling changed.");
+    setIsProcessing(false);
+    setSamplingMode(nextMode);
+    setIsEditorOpen(false);
+    replaceResult(null);
+  }
+
+  async function handleToggleBackgroundRemoval() {
+    if (!source || isAnalyzing || isProcessing) return;
+    if (
+      !source.backgroundRemoved &&
+      source.width * source.height > MAX_BACKGROUND_REMOVAL_PIXELS
+    ) {
+      setError(
+        "Background removal supports source images up to 4.2 megapixels.",
+      );
+      return;
+    }
+
+    const sourceAtStart = source;
+    const generation = ++loadGenerationRef.current;
+    conversionGenerationRef.current += 1;
+    resetImageWorkerClient("The source image is being updated.");
+    workerFallbackFileRef.current = null;
+    suggestionFocusRequestRef.current = false;
+    setError(null);
+    setIsAnalyzing(true);
+    setIsRemovingBackground(true);
+    setIsProcessing(false);
+    setIsEditorOpen(false);
+    await nextFrame();
+
+    if (
+      generation !== loadGenerationRef.current ||
+      sourceRef.current !== sourceAtStart
+    ) {
+      return;
+    }
+
+    let pendingUrl: string | null = null;
+
+    try {
+      let nextProcessingFile = sourceAtStart.originalProcessingFile;
+      const restoring = sourceAtStart.backgroundRemoved;
+
+      if (!restoring) {
+        let removal: {
+          blob: Blob | null;
+          width: number;
+          height: number;
+          detected: boolean;
+          removedPixels: number;
+          noOpaquePixels: boolean;
+        };
+        const worker = getImageWorkerClient();
+
+        if (worker) {
+          try {
+            removal = await worker.removeBackground(
+              sourceAtStart.processingFile,
+              {
+                expectedWidth: sourceAtStart.width,
+                expectedHeight: sourceAtStart.height,
+              },
+            );
+          } catch (workerError) {
+            if (
+              isAbortError(workerError) ||
+              !shouldFallbackFromImageWorker(workerError)
+            ) {
+              throw workerError;
+            }
+
+            removal = await removeBackgroundOnMainThread(sourceAtStart.image);
+          }
+        } else {
+          removal = await removeBackgroundOnMainThread(sourceAtStart.image);
+        }
+
+        if (
+          generation !== loadGenerationRef.current ||
+          sourceRef.current !== sourceAtStart
+        ) {
+          return;
+        }
+
+        if (removal.removedPixels === 0) {
+          setError(
+            removal.noOpaquePixels
+              ? "The source is already fully transparent."
+              : removal.detected
+                ? "No matching edge-connected background was found."
+                : "No safe, uniform edge background was found. The source was left unchanged.",
+          );
+          return;
+        }
+        if (!removal.blob) {
+          throw new Error("The cleaned source image could not be encoded.");
+        }
+
+        const cleanedName = `${sourceAtStart.file.name.replace(
+          /\.[^.]+$/,
+          "",
+        )}-background-removed.png`;
+        nextProcessingFile = new File([removal.blob], cleanedName, {
+          type: "image/png",
+          lastModified: sourceAtStart.file.lastModified,
+        });
+      }
+
+      const decoded = await decodePreview(nextProcessingFile);
+      pendingUrl = decoded.url;
+
+      if (
+        generation !== loadGenerationRef.current ||
+        sourceRef.current !== sourceAtStart
+      ) {
+        return;
+      }
+
+      const analysis = await analyzePreparedSource(
+        nextProcessingFile,
+        decoded.image,
+        sourceAtStart.width,
+        sourceAtStart.height,
+        restoring
+          ? []
+          : [
+              pixelSize,
+              ...(gridAmbiguity?.candidates.map(
+                (candidate) => candidate.pixelSize,
+              ) ?? []),
+            ].filter(
+              (candidate, index, candidates) =>
+                candidates.findIndex(
+                  (value) =>
+                    Math.abs(value - candidate) < GRID_VALUE_EPSILON,
+                ) === index,
+            ),
+      );
+
+      if (
+        generation !== loadGenerationRef.current ||
+        sourceRef.current !== sourceAtStart
+      ) {
+        return;
+      }
+
+      commitAnalyzedSource(
+        {
+          ...sourceAtStart,
+          processingFile: nextProcessingFile,
+          image: decoded.image,
+          url: decoded.url,
+          backgroundRemoved: !restoring,
+        },
+        analysis,
+        { preserveExistingGridWhenUndetected: true },
+      );
+      pendingUrl = null;
+      replaceResult(null);
+    } catch (caughtError) {
+      if (
+        generation === loadGenerationRef.current &&
+        !isAbortError(caughtError)
+      ) {
+        setError(
+          "The background could not be updated. Try a smaller PNG or WebP image.",
+        );
+      }
+    } finally {
+      if (pendingUrl) URL.revokeObjectURL(pendingUrl);
+      if (generation === loadGenerationRef.current) {
+        setIsAnalyzing(false);
+        setIsRemovingBackground(false);
+      }
+    }
+  }
+
   async function handlePixelize() {
     if (!source || isProcessing || isAnalyzing) return;
 
@@ -722,6 +1268,8 @@ function App() {
       pixelSize,
       offsetX: gridOffset.x,
       offsetY: gridOffset.y,
+      samplingMode,
+      fitToCanvas: samplingMode === "nearest" && !sourceAtStart.backgroundRemoved,
     };
     setError(null);
     setIsProcessing(true);
@@ -812,30 +1360,6 @@ function App() {
     }
   }
 
-  function reset() {
-    loadGenerationRef.current += 1;
-    conversionGenerationRef.current += 1;
-    resetImageWorkerClient("The workspace was reset.");
-    workerFallbackFileRef.current = null;
-    replaceSource(null);
-    replaceResult(null);
-    setPixelSize(8);
-    setGridOffset({ x: 0, y: 0 });
-    setConfidence(null);
-    setDetectedGrid(null);
-    setGridSuggestion(null);
-    setSuggestionDecision(null);
-    setAcceptedSuggestionPixelSize(null);
-    suggestionFocusRequestRef.current = false;
-    setStrictDetectionFailed(false);
-    setIsAnalyzing(false);
-    setIsProcessing(false);
-    setIsDragging(false);
-    setIsEditorOpen(false);
-    setSourcePalette([]);
-    setError(null);
-  }
-
   const downloadName = source
     ? `${source.file.name.replace(/\.[^.]+$/, "")}-pixel-perfect.png`
     : "pixel-perfect.png";
@@ -851,7 +1375,11 @@ function App() {
     Math.abs(gridOffset.x) < GRID_VALUE_EPSILON &&
     Math.abs(gridOffset.y) < GRID_VALUE_EPSILON;
   const detectionStatus =
-    confidence !== null
+    gridAmbiguity
+      ? gridAmbiguity.confidence === null
+        ? "PRESERVED · COMPARE GRIDS"
+        : `${gridAmbiguity.confidence}% · COMPARE GRIDS`
+      : confidence !== null
       ? `${confidence}% CONFIDENCE`
       : isSafeFallbackSetting
         ? "NO SINGLE GRID FOUND"
@@ -865,7 +1393,11 @@ function App() {
             <img
               alt=""
               aria-hidden="true"
-              src={pixelloidWordmark}
+              src={
+                theme === "light"
+                  ? pixelloidWordmarkLight
+                  : pixelloidWordmark
+              }
             />
           </span>
           <span className="version-badge">ALPHA</span>
@@ -876,9 +1408,14 @@ function App() {
           PIXEL ART, ACTUALLY.
         </p>
 
-        <button className="icon-button" type="button" onClick={reset}>
-          <RotateCcw size={15} strokeWidth={2.2} />
-          NEW
+        <button
+          className="icon-button"
+          type="button"
+          aria-label="Open settings"
+          onClick={() => setIsSettingsOpen(true)}
+        >
+          <Settings size={15} strokeWidth={2.2} />
+          <span>SETTINGS</span>
         </button>
       </header>
 
@@ -902,13 +1439,41 @@ function App() {
                 <span className="panel-label">SOURCE</span>
               </div>
               {source && (
-                <button
-                  className="text-button"
-                  type="button"
-                  onClick={openPicker}
-                >
-                  {isAnalyzing ? "ANALYZING…" : "REPLACE"}
-                </button>
+                <div className="source-header-actions">
+                  <button
+                    aria-label={
+                      source.backgroundRemoved
+                        ? "Restore original source background"
+                        : "Remove edge-connected source background before pixelization"
+                    }
+                    aria-pressed={source.backgroundRemoved}
+                    className="source-background-button"
+                    disabled={isAnalyzing || isProcessing}
+                    type="button"
+                    onClick={handleToggleBackgroundRemoval}
+                  >
+                    {source.backgroundRemoved ? (
+                      <RotateCcw aria-hidden="true" size={11} />
+                    ) : (
+                      <ImageOff aria-hidden="true" size={11} />
+                    )}
+                    {isRemovingBackground
+                      ? source.backgroundRemoved
+                        ? "RESTORING…"
+                        : "REMOVING…"
+                      : source.backgroundRemoved
+                        ? "RESTORE BG"
+                        : "REMOVE BG"}
+                  </button>
+                  <button
+                    className="text-button"
+                    disabled={isAnalyzing || isProcessing}
+                    type="button"
+                    onClick={openPicker}
+                  >
+                    REPLACE
+                  </button>
+                </div>
               )}
             </div>
 
@@ -987,9 +1552,13 @@ function App() {
                       {source.width} × {source.height} PX
                     </span>
                   </div>
-                  <span className="ready-badge">
+                  <span className="ready-badge" aria-live="polite">
                     <Check size={12} strokeWidth={3} />
-                    READY
+                    {isRemovingBackground
+                      ? "UPDATING"
+                      : source.backgroundRemoved
+                        ? "BG REMOVED"
+                        : "READY"}
                   </span>
                 </>
               ) : (
@@ -1169,7 +1738,95 @@ function App() {
               </strong>
             </div>
 
-            {strictDetectionFailed &&
+            <div className="metric sampling-metric">
+              <span>COLOR SAMPLE</span>
+              <div
+                aria-label="Pixel color sampling method"
+                className="sampling-toggle"
+                role="group"
+              >
+                <button
+                  aria-pressed={samplingMode === "nearest"}
+                  disabled={isAnalyzing || isProcessing}
+                  title="Use the exact source pixel at the center of each detected cell"
+                  type="button"
+                  onClick={() => updateSamplingMode("nearest")}
+                >
+                  NEAREST
+                </button>
+                <button
+                  aria-pressed={samplingMode === "medoid"}
+                  disabled={isAnalyzing || isProcessing}
+                  title="Use a robust representative color that actually exists in the source"
+                  type="button"
+                  onClick={() => updateSamplingMode("medoid")}
+                >
+                  MEDOID
+                </button>
+              </div>
+            </div>
+
+            {gridAmbiguity ? (
+              <div
+                aria-label="Ambiguous grid comparison"
+                className="grid-ambiguity"
+                role="group"
+              >
+                <span className="grid-suggestion-kicker">
+                  LOW CONFIDENCE · COMPARE BOTH
+                </span>
+                <div className="grid-ambiguity-options">
+                  {gridAmbiguity.candidates.map((candidate, index) => {
+                    const isSelected =
+                      Math.abs(pixelSize - candidate.pixelSize) <
+                        GRID_VALUE_EPSILON &&
+                      Math.abs(gridOffset.x - candidate.offsetX) <
+                        GRID_VALUE_EPSILON &&
+                      Math.abs(gridOffset.y - candidate.offsetY) <
+                        GRID_VALUE_EPSILON;
+                    const previewUrl =
+                      ambiguityPreviewUrls[candidate.kind];
+
+                    return (
+                      <button
+                        key={candidate.kind}
+                        aria-label={`${index === 0 ? "Recommended" : "Detected"} grid: ${candidate.width} by ${candidate.height} output at ${formatPixelSize(candidate.pixelSize)} source pixels`}
+                        aria-pressed={isSelected}
+                        className="grid-ambiguity-option"
+                        disabled={isAnalyzing || isProcessing}
+                        type="button"
+                        onClick={() => selectAmbiguousGrid(candidate)}
+                      >
+                        <span
+                          aria-hidden="true"
+                          className="grid-ambiguity-preview"
+                        >
+                          {previewUrl ? (
+                            <img alt="" src={previewUrl} />
+                          ) : ambiguityPreviewStatus === "loading" ? (
+                            <span className="grid-preview-loading" />
+                          ) : (
+                            <ImageOff
+                              className="grid-preview-unavailable"
+                              size={13}
+                            />
+                          )}
+                        </span>
+                        <span className="grid-ambiguity-copy">
+                          <strong>
+                            {candidate.width} × {candidate.height}
+                          </strong>
+                          <small>
+                            {formatPixelSize(candidate.pixelSize)} PX ·{" "}
+                            {index === 0 ? "RECOMMENDED" : "DETECTED"}
+                          </small>
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : strictDetectionFailed &&
             gridSuggestion &&
             suggestionOutputSize ? (
               <div
@@ -1302,7 +1959,6 @@ function App() {
         <PixelEditor
           palette={sourcePalette}
           result={result}
-          sourceFile={source.processingFile}
           sourceHeight={source.height}
           sourceUrl={source.url}
           sourceWidth={source.width}
@@ -1311,6 +1967,16 @@ function App() {
             setIsEditorOpen(false);
           }}
           onCancel={() => setIsEditorOpen(false)}
+        />
+      )}
+
+      {isSettingsOpen && (
+        <SettingsDialog
+          theme={theme}
+          chromaKey={chromaKey}
+          onThemeChange={setTheme}
+          onChromaKeyChange={(color) => setChromaKey(color.toLowerCase())}
+          onClose={() => setIsSettingsOpen(false)}
         />
       )}
     </div>

@@ -1,20 +1,137 @@
-# Pixelloid
+<p align="center">
+  <picture>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="./src/assets/pixelloid-wordmark-dark.png"
+    />
+    <source
+      media="(prefers-color-scheme: light)"
+      srcset="./src/assets/pixelloid-wordmark.png"
+    />
+    <img
+      alt="Pixelloid"
+      src="./src/assets/pixelloid-wordmark.png"
+      width="420"
+    />
+  </picture>
+</p>
 
-Pixelloid detects the enlarged pseudo-pixel grid in AI-generated pixel art and
-rebuilds the image at its true 1:1 resolution.
+<p align="center">
+  Turn enlarged, almost-pixel art into a true 1:1 pixel image.
+</p>
 
-The pixel editor also includes **Magic Fix**, a deterministic source-grid
-restoration pass. It examines the original pixels represented by every logical
-cell, rejects interpolation fringes and isolated noise, and selects a coherent
-source color without inventing new artwork. Processing is local, offline, and
-does not require a model download. Ambiguous cells and manually edited pixels
-are preserved; palette locking is optional.
+## What is Pixelloid?
+
+AI-generated pixel art often only looks pixel-perfect. Its apparent pixels are
+actually made from many source pixels, softened by interpolation, halos, color
+noise, or inconsistent edges.
+
+Pixelloid detects that hidden grid, creates an image at the grid's native
+resolution, and resolves every logical cell into one real output pixel. The
+entire process runs locally on your computer.
+
+## Features
+
+- Automatic pseudo-pixel grid detection. Weak fractional detections show both
+  the information-preserving integer grid and the exact detected grid as
+  side-by-side previews.
+- Reversible, edge-connected background removal on the source image before grid
+  detection and conversion, preserving enclosed artwork.
+- Manual source-pixel-size adjustment before conversion.
+- Standard nearest-neighbor resampling by default, with an optional
+  foreground-phase-aware medoid sampler. Both modes emit complete RGBA colors
+  that exist in the source.
+- Local conversion to a true-resolution PNG.
+- Side-by-side source and result previews.
+- Pixel editor with pencil, fill, eyedropper, eraser, crop, undo, custom colors,
+  and source-derived palettes.
+- Scroll-wheel and button zoom controls.
+- A resolution-matched original-image overlay for checking edits.
+- Persistent application settings for dark/light themes and the transparency
+  chroma-key color.
+- PNG, JPEG, WebP, GIF, AVIF, and BMP import. GIF import uses one frame.
+- No image uploads, accounts, cloud APIs, or model downloads.
+
+## How conversion works
+
+Pixelloid first estimates the apparent source-pixel pitch and output
+resolution. Nearest mode uses the conventional output-center-to-source
+nearest-neighbor mapping on an untouched canvas. After background removal, it
+aligns the grid to the surviving foreground before sampling the center of every
+source cell. Medoid mode instead chooses a robust complete RGBA sample observed
+inside each cell. Conversion is deterministic and never generates new artwork.
 
 ## Development
+
+### Requirements
+
+- Node.js and npm
+- A Rust toolchain
+- The platform prerequisites required by Tauri 2
+
+Install dependencies and launch the desktop app:
 
 ```sh
 npm install
 npm run tauri dev
 ```
 
-Use `npm run dev` to run only the Vite frontend in a browser.
+Run only the Vite frontend:
+
+```sh
+npm run dev
+```
+
+Run the test suite:
+
+```sh
+npm test
+```
+
+Build the frontend:
+
+```sh
+npm run build
+```
+
+Create native release bundles:
+
+```sh
+npm run tauri build
+```
+
+Pushing a version tag such as `v0.1.0` runs the GitHub release workflow. It
+tests the project, builds Linux and Windows x64 installers plus macOS Intel and
+Apple Silicon bundles, then attaches them to one GitHub Release.
+
+On macOS, release artifacts are written beneath:
+
+```text
+src-tauri/target/release/bundle/
+```
+
+## Project structure
+
+```text
+src/
+├── components/              React UI and pixel editor
+├── lib/
+│   ├── backgroundRemoval.ts
+│   ├── gridDetection.ts
+│   ├── imageWorkerClient.ts
+│   └── pixelizeCore.ts
+└── workers/                 Off-main-thread image processing
+
+src-tauri/                   Tauri application shell and native packaging
+tests/                       Grid, pixelization, and background-removal tests
+```
+
+## Current limits
+
+- Source images are limited to 40 million decoded pixels.
+- Background removal is limited to 4.2 million source pixels to keep its
+  full-resolution edge traversal within a safe memory bound.
+- Grid suggestions are advisory when the source does not contain one clear,
+  consistent lattice.
+
+Pixelloid is currently in alpha.
