@@ -31,7 +31,7 @@
 </p>
 
 <p align="center">
-  <em>Detect the source grid, remove the background, and compare the true-resolution result.</em>
+  <em>Detect the source grid, remove the background, and compare the true-resolution result using the Medoid sampler.</em>
 </p>
 
 <p align="center">
