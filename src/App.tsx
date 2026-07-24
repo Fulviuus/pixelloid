@@ -562,6 +562,9 @@ function App() {
           fitToCanvas:
             samplingMode === "nearest" &&
             !previewSource.backgroundRemoved,
+          fitForeground:
+            samplingMode === "nearest" &&
+            previewSource.backgroundRemoved,
         };
         let url: string;
 
@@ -1269,7 +1272,12 @@ function App() {
       offsetX: gridOffset.x,
       offsetY: gridOffset.y,
       samplingMode,
-      fitToCanvas: samplingMode === "nearest" && !sourceAtStart.backgroundRemoved,
+      // Preserve the logical canvas, but fit a removed foreground on its own
+      // nearest-neighbor lattice so transparent padding cannot shift it.
+      fitToCanvas:
+        samplingMode === "nearest" && !sourceAtStart.backgroundRemoved,
+      fitForeground:
+        samplingMode === "nearest" && sourceAtStart.backgroundRemoved,
     };
     setError(null);
     setIsProcessing(true);

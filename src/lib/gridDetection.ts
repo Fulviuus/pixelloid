@@ -14,6 +14,11 @@ export type PixelGridSettings = {
   samplingMode?: PixelSamplingMode;
   /** Match a conventional whole-canvas nearest-neighbor resize. */
   fitToCanvas?: boolean;
+  /**
+   * Fit the opaque foreground independently while retaining the full output
+   * canvas. This prevents transparent padding from shifting nearest samples.
+   */
+  fitForeground?: boolean;
 };
 
 export type PixelGridSuggestion = {

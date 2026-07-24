@@ -104,7 +104,7 @@ describe("pixelizeBuffer", () => {
     ]);
   });
 
-  it("matches conventional whole-canvas nearest-neighbor coordinates", () => {
+  it("matches FFmpeg/libswscale whole-canvas point coordinates", () => {
     const source = rgbaBuffer(10, 1);
     for (let x = 0; x < source.width; x += 1) {
       const offset = x * 4;
@@ -125,9 +125,72 @@ describe("pixelizeBuffer", () => {
     ]);
     expect([...result.data]).toEqual([
       1, 21, 41, 255,
-      5, 25, 45, 255,
+      4, 24, 44, 255,
       8, 28, 48, 255,
     ]);
+  });
+
+  it("fits a transparent foreground without changing the logical canvas", () => {
+    const source = rgbaBuffer(10, 10);
+    source.data.fill(0);
+
+    for (let y = 2; y < 8; y += 1) {
+      for (let x = 2; x < 8; x += 1) {
+        const offset = (y * source.width + x) * 4;
+        source.data.set([x, y, x + y, 255], offset);
+      }
+    }
+
+    const result = pixelizeBuffer(source, {
+      pixelSize: 2,
+      offsetX: 0,
+      offsetY: 0,
+      fitForeground: true,
+    });
+
+    expect([result.width, result.height]).toEqual([5, 5]);
+    expect([...result.data.slice(0, 4)]).toEqual([0, 0, 0, 0]);
+    expect([
+      ...result.data.slice((1 * result.width + 1) * 4, (1 * result.width + 1) * 4 + 4),
+    ]).toEqual([3, 3, 6, 255]);
+    expect([
+      ...result.data.slice((3 * result.width + 3) * 4, (3 * result.width + 3) * 4 + 4),
+    ]).toEqual([7, 7, 14, 255]);
+    expect([
+      ...result.data.slice((4 * result.width + 4) * 4, (4 * result.width + 4) * 4 + 4),
+    ]).toEqual([0, 0, 0, 0]);
+  });
+
+  it("removes isolated light-neutral fringe without deleting interior highlights", () => {
+    const source = rgbaBuffer(10, 10);
+    source.data.fill(0);
+
+    for (let y = 2; y < 8; y += 1) {
+      for (let x = 2; x < 8; x += 1) {
+        source.data.set(
+          [32, 34, 33, 255],
+          (y * source.width + x) * 4,
+        );
+      }
+    }
+    source.data.set([224, 223, 225, 255], (5 * source.width + 7) * 4);
+    source.data.set([230, 229, 231, 255], (5 * source.width + 5) * 4);
+
+    const result = pixelizeBuffer(source, {
+      pixelSize: 2,
+      offsetX: 0,
+      offsetY: 0,
+      fitForeground: true,
+    });
+    const edgeOffset = (2 * result.width + 3) * 4;
+    const interiorOffset = (2 * result.width + 2) * 4;
+
+    expect([...result.data.slice(edgeOffset, edgeOffset + 4)]).toEqual([
+      0, 0, 0, 0,
+    ]);
+    expect([
+      ...result.data.slice(interiorOffset, interiorOffset + 4),
+    ]).toEqual([230, 229, 231, 255]);
   });
 
   it("uses a robust observed-source medoid when requested", () => {

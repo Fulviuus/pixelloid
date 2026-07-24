@@ -81,11 +81,12 @@ entire process runs locally on your computer.
 ## How conversion works
 
 Pixelloid first estimates the apparent source-pixel pitch and output
-resolution. Nearest mode uses the conventional output-center-to-source
-nearest-neighbor mapping on an untouched canvas. After background removal, it
-aligns the grid to the surviving foreground before sampling the center of every
-source cell. Medoid mode instead chooses a robust complete RGBA sample observed
-inside each cell. Conversion is deterministic and never generates new artwork.
+resolution. Nearest mode matches FFmpeg/libswscale point sampling. After
+background removal, it fits the opaque foreground independently and places it
+back on the original logical canvas so transparent padding cannot shift its
+pixels. Medoid mode instead aligns the inferred grid to the surviving
+foreground and chooses a robust complete RGBA sample observed inside each cell.
+Conversion is deterministic and never generates new artwork.
 
 ## Development
 

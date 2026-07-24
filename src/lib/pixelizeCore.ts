@@ -17,6 +17,19 @@ export type PixelizedBuffer = PixelBuffer & {
 
 const MAX_SAMPLE_COUNT = 7 * 7;
 const IDENTITY_EPSILON = 1e-6;
+const SWS_FIXED_POINT_SCALE = 1 << 16;
+const FOREGROUND_ALPHA_THRESHOLD = 16;
+
+type ForegroundFit = {
+  sourceLeft: number;
+  sourceTop: number;
+  sourceRight: number;
+  sourceBottom: number;
+  outputLeft: number;
+  outputTop: number;
+  outputWidth: number;
+  outputHeight: number;
+};
 
 function getBoundedCell(
   source: PixelBuffer,
@@ -86,18 +99,246 @@ function sampleNearestCanvasInto(
   output: Uint8ClampedArray,
   outputOffset: number,
 ) {
-  // This is the nearest-neighbor coordinate transform used by conventional
-  // image resizers: map the center of the output texel into source space.
+  // Match FFmpeg/libswscale SWS_POINT sampling. libswscale advances through
+  // source space with a truncated 16.16 fixed-point increment, starting at
+  // half that increment. This differs from floating-point center mapping at
+  // exact boundaries (for example, 10 -> 3 samples source indexes 1, 4, 8).
+  const xIncrement = Math.floor(
+    (source.width * SWS_FIXED_POINT_SCALE) / outputWidth,
+  );
+  const yIncrement = Math.floor(
+    (source.height * SWS_FIXED_POINT_SCALE) / outputHeight,
+  );
   const x = Math.min(
     source.width - 1,
-    Math.floor(((outputX + 0.5) * source.width) / outputWidth),
+    Math.floor(
+      ((outputX * 2 + 1) * xIncrement) / (SWS_FIXED_POINT_SCALE * 2),
+    ),
   );
   const y = Math.min(
     source.height - 1,
-    Math.floor(((outputY + 0.5) * source.height) / outputHeight),
+    Math.floor(
+      ((outputY * 2 + 1) * yIncrement) / (SWS_FIXED_POINT_SCALE * 2),
+    ),
   );
 
   copySourcePixel(source, x, y, output, outputOffset);
+}
+
+function fixedPointSourceIndex(
+  sourceStart: number,
+  sourceLength: number,
+  outputIndex: number,
+  outputLength: number,
+) {
+  const increment = Math.floor(
+    (sourceLength * SWS_FIXED_POINT_SCALE) / outputLength,
+  );
+  return (
+    sourceStart +
+    Math.floor(
+      ((outputIndex * 2 + 1) * increment) /
+        (SWS_FIXED_POINT_SCALE * 2),
+    )
+  );
+}
+
+function findDominantOccupiedSpan(
+  occupancy: Uint32Array,
+  rawStart: number,
+  rawEnd: number,
+  minimumOccupancy: number,
+): [number, number] {
+  let bestStart = rawStart;
+  let bestEnd = rawStart;
+  let runStart = -1;
+
+  for (let index = rawStart; index <= rawEnd; index += 1) {
+    if (occupancy[index] >= minimumOccupancy) {
+      if (runStart < 0) runStart = index;
+      continue;
+    }
+
+    if (runStart >= 0 && index - runStart > bestEnd - bestStart) {
+      bestStart = runStart;
+      bestEnd = index;
+    }
+    runStart = -1;
+  }
+
+  if (runStart >= 0 && rawEnd + 1 - runStart > bestEnd - bestStart) {
+    bestStart = runStart;
+    bestEnd = rawEnd + 1;
+  }
+
+  return bestEnd > bestStart
+    ? [bestStart, bestEnd]
+    : [rawStart, rawEnd + 1];
+}
+
+function findForegroundFit(
+  source: PixelBuffer,
+  pixelSize: number,
+  outputWidth: number,
+  outputHeight: number,
+): ForegroundFit | null {
+  const columnOccupancy = new Uint32Array(source.width);
+  const rowOccupancy = new Uint32Array(source.height);
+  let rawLeft = source.width;
+  let rawTop = source.height;
+  let rawRight = -1;
+  let rawBottom = -1;
+  let opaquePixels = 0;
+
+  for (let y = 0; y < source.height; y += 1) {
+    for (let x = 0; x < source.width; x += 1) {
+      if (
+        source.data[(y * source.width + x) * 4 + 3] <
+        FOREGROUND_ALPHA_THRESHOLD
+      ) {
+        continue;
+      }
+      columnOccupancy[x] += 1;
+      rowOccupancy[y] += 1;
+      rawLeft = Math.min(rawLeft, x);
+      rawTop = Math.min(rawTop, y);
+      rawRight = Math.max(rawRight, x);
+      rawBottom = Math.max(rawBottom, y);
+      opaquePixels += 1;
+    }
+  }
+
+  if (
+    opaquePixels === 0 ||
+    opaquePixels === source.width * source.height ||
+    rawRight < rawLeft ||
+    rawBottom < rawTop
+  ) {
+    return null;
+  }
+
+  const rawWidth = rawRight - rawLeft + 1;
+  const rawHeight = rawBottom - rawTop + 1;
+  const fittedWidth = Math.max(1, Math.round(rawWidth / pixelSize));
+  const fittedHeight = Math.max(1, Math.round(rawHeight / pixelSize));
+  let [sourceLeft, sourceRight] = findDominantOccupiedSpan(
+    columnOccupancy,
+    rawLeft,
+    rawRight,
+    Math.max(2, Math.ceil(rawHeight * 0.01)),
+  );
+  let [sourceTop, sourceBottom] = findDominantOccupiedSpan(
+    rowOccupancy,
+    rawTop,
+    rawBottom,
+    Math.max(2, Math.ceil(rawWidth * 0.01)),
+  );
+
+  // An even source span resized to an even output has no single center texel.
+  // Preserve one available trailing texel so libswscale's half-step mapping
+  // remains centered instead of drifting toward the leading edge.
+  if (
+    (sourceRight - sourceLeft) % 2 === 0 &&
+    fittedWidth % 2 === 0 &&
+    sourceRight < rawRight + 1
+  ) {
+    sourceRight += 1;
+  }
+  if (
+    (sourceBottom - sourceTop) % 2 === 0 &&
+    fittedHeight % 2 === 0 &&
+    sourceBottom < rawBottom + 1
+  ) {
+    sourceBottom += 1;
+  }
+
+  const outputLeft = Math.max(
+    0,
+    Math.min(outputWidth - fittedWidth, Math.round(rawLeft / pixelSize)),
+  );
+  const outputTop = Math.max(
+    0,
+    Math.min(outputHeight - fittedHeight, Math.round(rawTop / pixelSize)),
+  );
+
+  return {
+    sourceLeft,
+    sourceTop,
+    sourceRight,
+    sourceBottom,
+    outputLeft,
+    outputTop,
+    outputWidth: Math.min(fittedWidth, outputWidth),
+    outputHeight: Math.min(fittedHeight, outputHeight),
+  };
+}
+
+function removeIsolatedLightEdgeFringe(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+) {
+  const fringe = new Uint8Array(width * height);
+
+  function isLightNeutral(offset: number) {
+    const red = data[offset];
+    const green = data[offset + 1];
+    const blue = data[offset + 2];
+    const luminance = red * 0.299 + green * 0.587 + blue * 0.114;
+    return (
+      luminance >= 145 &&
+      Math.max(red, green, blue) - Math.min(red, green, blue) <= 24
+    );
+  }
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const pixelIndex = y * width + x;
+      const offset = pixelIndex * 4;
+      if (
+        data[offset + 3] < FOREGROUND_ALPHA_THRESHOLD ||
+        !isLightNeutral(offset)
+      ) {
+        continue;
+      }
+
+      let touchesTransparency = false;
+      let lightNeutralNeighbors = 0;
+
+      for (
+        let neighborY = Math.max(0, y - 1);
+        neighborY <= Math.min(height - 1, y + 1);
+        neighborY += 1
+      ) {
+        for (
+          let neighborX = Math.max(0, x - 1);
+          neighborX <= Math.min(width - 1, x + 1);
+          neighborX += 1
+        ) {
+          if (neighborX === x && neighborY === y) continue;
+          const neighborOffset = (neighborY * width + neighborX) * 4;
+          if (data[neighborOffset + 3] < FOREGROUND_ALPHA_THRESHOLD) {
+            touchesTransparency = true;
+          } else if (isLightNeutral(neighborOffset)) {
+            lightNeutralNeighbors += 1;
+          }
+        }
+      }
+
+      if (touchesTransparency && lightNeutralNeighbors <= 2) {
+        fringe[pixelIndex] = 1;
+      }
+    }
+  }
+
+  for (let pixelIndex = 0; pixelIndex < fringe.length; pixelIndex += 1) {
+    if (!fringe[pixelIndex]) continue;
+    const offset = pixelIndex * 4;
+    data[offset] = 0;
+    data[offset + 1] = 0;
+    data[offset + 2] = 0;
+    data[offset + 3] = 0;
+  }
 }
 
 function buildCanvasFitRanges(length: number, count: number): CellRange[] {
@@ -266,6 +507,10 @@ export function pixelizeBuffer(
   const width = xRanges.length;
   const height = yRanges.length;
   const data = new Uint8ClampedArray(width * height * 4);
+  const foregroundFit =
+    samplingMode === "nearest" && settings.fitForeground === true
+      ? findForegroundFit(source, settings.pixelSize, width, height)
+      : null;
   const samples =
     samplingMode === "medoid"
       ? new Uint8Array(MAX_SAMPLE_COUNT * 4)
@@ -278,7 +523,37 @@ export function pixelizeBuffer(
       const xRange = xRanges[x];
       const outputOffset = (y * width + x) * 4;
 
-      if (fitToCanvas) {
+      if (
+        foregroundFit &&
+        x >= foregroundFit.outputLeft &&
+        x < foregroundFit.outputLeft + foregroundFit.outputWidth &&
+        y >= foregroundFit.outputTop &&
+        y < foregroundFit.outputTop + foregroundFit.outputHeight
+      ) {
+        const sourceX = fixedPointSourceIndex(
+          foregroundFit.sourceLeft,
+          foregroundFit.sourceRight - foregroundFit.sourceLeft,
+          x - foregroundFit.outputLeft,
+          foregroundFit.outputWidth,
+        );
+        const sourceY = fixedPointSourceIndex(
+          foregroundFit.sourceTop,
+          foregroundFit.sourceBottom - foregroundFit.sourceTop,
+          y - foregroundFit.outputTop,
+          foregroundFit.outputHeight,
+        );
+        copySourcePixel(
+          source,
+          Math.min(foregroundFit.sourceRight - 1, sourceX),
+          Math.min(foregroundFit.sourceBottom - 1, sourceY),
+          data,
+          outputOffset,
+        );
+      } else if (foregroundFit) {
+        // The background was explicitly removed, so leave the rest of the
+        // logical canvas transparent instead of sampling stray RGB values.
+        continue;
+      } else if (fitToCanvas) {
         sampleNearestCanvasInto(
           source,
           x,
@@ -311,6 +586,10 @@ export function pixelizeBuffer(
         );
       }
     }
+  }
+
+  if (foregroundFit) {
+    removeIsolatedLightEdgeFringe(data, width, height);
   }
 
   return {
